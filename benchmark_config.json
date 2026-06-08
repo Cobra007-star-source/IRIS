@@ -1,0 +1,26 @@
+{
+  "framework": "iris",
+  "tests": [
+    {
+      "default": {
+        "json_url": "/json",
+        "plaintext_url": "/plaintext",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Platform",
+        "database": "None",
+        "framework": "iris",
+        "language": "C++",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "None",
+        "webserver": "iris",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "iris",
+        "notes": "Thread-per-core epoll gateway; SO_REUSEPORT, zero-allocation steady state, precomputed response templates.",
+        "versus": "None"
+      }
+    }
+  ]
+}

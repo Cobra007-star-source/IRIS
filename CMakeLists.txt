@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(iris
     VERSION 0.1.0
-    LANGUAGES CXX
-    DESCRIPTION "Irisoul's Resolver for Inline Schema - SIMD JSON Schema validator"
+    LANGUAGES C CXX
+    DESCRIPTION "Irisoul's Resolver for Inline Schema - SIMD JSON Schema validator + gateway"
 )
 
 # -----------------------------------------------------------------------------
@@ -18,11 +18,18 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Global sanitizer selector (defined early so the LTO guard below can see it).
+set(IRIS_SANITIZER "" CACHE STRING "Global sanitizer: '' | address | thread | undefined")
+
 # 开启 LTO 让 simd_ops / parser / validator 跨 TU 内联。
 # Phase 1 已确认 NEON 单循环吞吐 33 GB/s；FastPath 校验吞吐瓶颈在
 # 函数调用边界（无法跨 TU 内联）。LTO 一刀切掉这层。
 if(NOT DEFINED IRIS_ENABLE_LTO)
     set(IRIS_ENABLE_LTO ON)
+endif()
+# LTO and the sanitizer runtimes do not mix cleanly; disable LTO under a sanitizer.
+if(IRIS_SANITIZER)
+    set(IRIS_ENABLE_LTO OFF)
 endif()
 if(IRIS_ENABLE_LTO)
     include(CheckIPOSupported)
@@ -46,6 +53,22 @@ option(IRIS_BUILD_TESTS      "Build IRIS unit tests"        ON)
 option(IRIS_BUILD_SIMDJSON   "Fetch and link simdjson for cross-comparison" ON)
 option(IRIS_BUILD_BOWTIE     "Build Bowtie protocol harness" ON)
 option(IRIS_ENABLE_JIT       "Enable JIT code generation"   OFF)
+option(IRIS_BUILD_GATEWAY    "Build the IRIS HTTP gateway (TechEmpower target)" ON)
+
+# Deployment profile for the gateway: "racing" (epoll/SO_REUSEPORT/pinned, max
+# throughput) or "production" (portable, conservative defaults).
+set(IRIS_PROFILE "racing" CACHE STRING "Gateway profile: racing | production")
+set_property(CACHE IRIS_PROFILE PROPERTY STRINGS racing production)
+
+# Quality-gate knobs (see gateway/ and fuzz/). IRIS_SANITIZER is declared above
+# (it gates LTO); the fuzzer is a self-contained instrumented target.
+option(IRIS_BUILD_FUZZER "Build libFuzzer harness for the HTTP parser" OFF)
+
+if(IRIS_SANITIZER)
+    message(STATUS "[iris] Sanitizer     : ${IRIS_SANITIZER}")
+    add_compile_options(-fsanitize=${IRIS_SANITIZER} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${IRIS_SANITIZER})
+endif()
 
 # -----------------------------------------------------------------------------
 # Core library: iris
@@ -89,7 +112,7 @@ if(IRIS_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
-if(IRIS_BUILD_SIMDJSON OR IRIS_ENABLE_JIT)
+if(IRIS_BUILD_SIMDJSON OR IRIS_ENABLE_JIT OR IRIS_BUILD_GATEWAY)
     include(FetchContent)
 endif()
 
@@ -135,6 +158,30 @@ else()
     message(STATUS "[iris] re2          : not found (slow-path falls back to std::regex)")
 endif()
 
+# -----------------------------------------------------------------------------
+# Gateway: thread-per-core HTTP server targeting TechEmpower network tracks.
+# Vendors picohttpparser (request parsing); builds it as a tiny static lib since
+# upstream ships no CMake project.
+# -----------------------------------------------------------------------------
+if(IRIS_BUILD_GATEWAY)
+    FetchContent_Declare(
+        picohttpparser
+        GIT_REPOSITORY https://github.com/h2o/picohttpparser.git
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(picohttpparser)
+
+    add_library(picohttpparser STATIC
+        ${picohttpparser_SOURCE_DIR}/picohttpparser.c)
+    target_include_directories(picohttpparser PUBLIC ${picohttpparser_SOURCE_DIR})
+    # picohttpparser auto-selects SSE4.2 on x86 via __SSE4_2__; the global arch
+    # flags already enable AVX2/SSE on x86_64, NEON on arm64.
+    target_compile_options(picohttpparser PRIVATE ${IRIS_ARCH_FLAGS})
+
+    add_subdirectory(gateway)
+endif()
+
 if(IRIS_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
     add_subdirectory(bench)
@@ -157,5 +204,6 @@ message(STATUS "  Examples        : ${IRIS_BUILD_EXAMPLES}")
 message(STATUS "  Benchmarks      : ${IRIS_BUILD_BENCHMARKS}")
 message(STATUS "  Tests           : ${IRIS_BUILD_TESTS}")
 message(STATUS "  JIT enabled     : ${IRIS_ENABLE_JIT}")
+message(STATUS "  Gateway         : ${IRIS_BUILD_GATEWAY} (profile: ${IRIS_PROFILE})")
 message(STATUS "==================================================")
 message(STATUS "")

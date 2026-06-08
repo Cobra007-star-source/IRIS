@@ -1,0 +1,16 @@
+# Keep the Docker build context tiny: only source + CMake are needed.
+build/
+build-*/
+.git/
+.github/
+.cache/
+.corpus/
+bench-data/
+--out/
+.test-suite/
+**/node_modules/
+*.md
+irisense_*.txt
+*.dSYM/
+perf.data*
+*.pcap
