@@ -62,11 +62,28 @@ void json_write_string(Buffer& out, std::string_view s) noexcept {
     out.append('"');
 }
 
-// Serialize {"message": <msg>}.
+// The /json response models an actual object, not a pre-baked string. TFB's
+// JSON rule forbids returning a hard-coded JSON literal: the object must be
+// instantiated and serialized field-by-field at request time. This struct is
+// that object; serialize() walks its fields and converts each to the byte
+// stream, so the body is genuinely produced per request.
+struct Message {
+    std::string_view message;
+
+    void serialize(Buffer& out) const noexcept {
+        out.append('{');
+        // field 1: "message"
+        json_write_string(out, "message");
+        out.append(':');
+        json_write_string(out, message);
+        out.append('}');
+    }
+};
+
+// Instantiate the object from runtime data and serialize it into `out`.
 void serialize_message(Buffer& out, std::string_view msg) noexcept {
-    out.append("{\"message\":");
-    json_write_string(out, msg);
-    out.append('}');
+    Message obj{msg};
+    obj.serialize(out);
 }
 
 // ---- precomputed response templates -----------------------------------------
