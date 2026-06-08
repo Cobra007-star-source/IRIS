@@ -1,13 +1,33 @@
+# Build output
 build/
 build-*/
 .cache/
-.DS_Store
+cmake-build-*/
+
+# Object / archive / shared-lib artifacts
 *.o
 *.a
 *.dylib
 *.so
 *.dSYM/
 compile_commands.json
+
+# Editor / IDE
+.DS_Store
 .vscode/
 .idea/
 .cursor/
+
+# Generated benchmark corpora and outputs (reproducible via gen_corpus)
+--out/
+.corpus/
+bench-data/
+
+# Node deps (ajv comparison harness)
+node_modules/
+
+# Profiling / capture artifacts
+perf.data*
+*.pcap
+flamegraph*.svg
+/tmp/perf-*.map
