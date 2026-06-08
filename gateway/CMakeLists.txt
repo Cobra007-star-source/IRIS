@@ -33,6 +33,16 @@ add_executable(iris-gw main.cpp)
 target_link_libraries(iris-gw PRIVATE iris_net)
 target_compile_options(iris-gw PRIVATE ${IRIS_ARCH_FLAGS})
 
+# Optional JIT serializer for the /json route. Built only with -DIRIS_ENABLE_JIT=ON
+# (asmjit is fetched by the root CMake before this subdirectory is added). The
+# default racing build stays free of asmjit and runs the portable C++
+# serializer; the JIT path is a drop-in fast path selected at runtime.
+if(IRIS_ENABLE_JIT)
+    target_sources(iris-gw PRIVATE ${CMAKE_SOURCE_DIR}/src/jit/serializer.cpp)
+    target_link_libraries(iris-gw PRIVATE asmjit)
+    target_compile_definitions(iris-gw PRIVATE IRIS_HAVE_ASMJIT=1)
+endif()
+
 # -----------------------------------------------------------------------------
 # libFuzzer harness for the HTTP request parser (self-contained: instruments
 # both the wrapper and picohttpparser.c with fuzzer + ASan). Only built where

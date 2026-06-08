@@ -27,6 +27,10 @@
 #include "iris/http/response.hpp"
 #include "iris/net/server.hpp"
 
+#if defined(IRIS_HAVE_ASMJIT)
+    #include "iris/jit/serializer.hpp"
+#endif
+
 namespace {
 
 using iris::http::Buffer;
@@ -35,6 +39,14 @@ using iris::http::Request;
 constexpr std::string_view kHelloPlain = "Hello, World!";
 constexpr std::string_view kHelloMsg   = "Hello, World!";
 constexpr std::size_t       kDateLen   = 29;
+
+#if defined(IRIS_HAVE_ASMJIT)
+// Compiled once at startup (cold path) from the exact bytes the C++ serializer
+// produces. On the /json hot path the worker invokes this machine code, which
+// emits the body with a few wide register stores (block write + overlapping
+// tail). nullptr until compile() succeeds; the C++ serializer is the fallback.
+iris::jit::JsonSerializer g_json_jit;
+#endif
 
 // ---- minimal JSON serializer -------------------------------------------------
 
@@ -84,6 +96,24 @@ struct Message {
 void serialize_message(Buffer& out, std::string_view msg) noexcept {
     Message obj{msg};
     obj.serialize(out);
+}
+
+// /json body emission for the hot path. When the JIT serializer compiled
+// successfully it writes the body straight into the buffer's tail with wide
+// stores; otherwise the portable C++ object serializer runs. The branch is a
+// single, perfectly-predicted load+test (the JIT pointer never changes after
+// startup), so the [[likely]] path is effectively free.
+inline void emit_json_body(Buffer& out) noexcept {
+#if defined(IRIS_HAVE_ASMJIT)
+    const iris::jit::SerializeFn fn = g_json_jit.fn();
+    if (fn != nullptr) [[likely]] {
+        const std::size_t n   = g_json_jit.length();
+        char*             dst = out.append_uninitialized(n);
+        if (dst != nullptr) [[likely]] { fn(dst); }
+        return;
+    }
+#endif
+    serialize_message(out, kHelloMsg);
 }
 
 // ---- precomputed response templates -----------------------------------------
@@ -148,11 +178,11 @@ void handle(const Request& req, Buffer& out) {
     if (req.path == "/json") {
         if (fast_path(req)) {
             emit_template(out, g_json_hdr);
-            serialize_message(out, kHelloMsg);
+            emit_json_body(out);
         } else {
             char   scratch[64];
             Buffer body(scratch, sizeof(scratch));
-            serialize_message(body, kHelloMsg);
+            emit_json_body(body);
             iris::http::write_response(out, 200, "OK", "application/json",
                                        body.view(), req.minor_version, req.keep_alive);
         }
@@ -160,15 +190,6 @@ void handle(const Request& req, Buffer& out) {
     }
     iris::http::write_response(out, 404, "Not Found", "text/plain", "",
                                req.minor_version, req.keep_alive);
-}
-
-// Compute the serialized /json body length once so the template's
-// Content-Length matches exactly.
-std::size_t json_body_length() {
-    char   scratch[64];
-    Buffer b(scratch, sizeof(scratch));
-    serialize_message(b, kHelloMsg);
-    return b.size();
 }
 
 }  // namespace
@@ -190,8 +211,26 @@ int main(int argc, char** argv) {
     }
 
     iris::http::start_date_clock();
-    g_plain    = build_template("text/plain", kHelloPlain.size(), kHelloPlain, true);
-    g_json_hdr = build_template("application/json", json_body_length(), {}, false);
+    g_plain = build_template("text/plain", kHelloPlain.size(), kHelloPlain, true);
+
+    // Serialize the /json body once with the C++ serializer: it is the source
+    // of truth for Content-Length and the exact byte sequence the JIT
+    // specializes. compile() reads these bytes synchronously (baking them as
+    // immediates), so the stack buffer need not outlive the call.
+    char   canon_buf[64];
+    Buffer canon(canon_buf, sizeof(canon_buf));
+    serialize_message(canon, kHelloMsg);
+    g_json_hdr = build_template("application/json", canon.size(), {}, false);
+
+#if defined(IRIS_HAVE_ASMJIT)
+    if (g_json_jit.compile(canon.view())) {
+        std::printf("[iris-gw] /json serializer: JIT block-write (%zu bytes)\n",
+                    g_json_jit.length());
+    } else {
+        std::fprintf(stderr,
+                     "[iris-gw] /json serializer: JIT unavailable, C++ fallback\n");
+    }
+#endif
 
     int workers = cfg.workers > 0 ? cfg.workers : 0;
     std::printf("[iris-gw] listening on :%u (workers=%s, reuseport=%d)\n",

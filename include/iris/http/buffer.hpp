@@ -50,6 +50,18 @@ public:
         data_[len_++] = c;
     }
 
+    // Reserve `n` writable bytes at the tail and return a pointer to them, or
+    // nullptr on overflow (overflow() latches). The bytes are treated as
+    // appended immediately; the caller must write exactly `n` bytes through the
+    // pointer. Used by the JIT serializer, which emits raw stores straight into
+    // the write buffer with no intermediate copy.
+    [[nodiscard]] char* append_uninitialized(std::size_t n) noexcept {
+        if (n > cap_ - len_) { overflow_ = true; return nullptr; }
+        char* p = data_ + len_;
+        len_ += n;
+        return p;
+    }
+
     // Append an unsigned decimal integer with no allocation.
     void append_uint(std::size_t v) noexcept {
         char tmp[20];
