@@ -4,6 +4,7 @@ add_executable(iris_tests
     test_validator.cpp
     test_inspector.cpp
     test_slow_path.cpp
+    test_jit_serializer.cpp
     test_main.cpp
 )
 target_link_libraries(iris_tests PRIVATE iris)

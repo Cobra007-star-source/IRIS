@@ -85,6 +85,7 @@ add_library(iris STATIC
     src/slow_schema.cpp
     src/slow_eval.cpp
     src/jit.cpp
+    src/jit/serializer.cpp
     src/validator.cpp
 )
 
