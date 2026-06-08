@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "id":     {"type": "integer", "minimum": 0},
+    "name":   {"type": "string",  "minLength": 1, "maxLength": 64},
+    "addr":   {
+      "type": "object",
+      "properties": {
+        "city":    {"type": "string", "minLength": 1, "maxLength": 32},
+        "country": {"type": "string", "minLength": 2, "maxLength": 32},
+        "zip":     {"type": "string", "maxLength": 16}
+      },
+      "required": ["city"],
+      "additionalProperties": false
+    },
+    "tags":   {"type": "array", "items": {"type": "string"}},
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ts":   {"type": "integer", "minimum": 0},
+          "kind": {"type": "string"}
+        },
+        "required": ["ts", "kind"]
+      }
+    }
+  },
+  "required": ["id", "name"],
+  "additionalProperties": false
+}

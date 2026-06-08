@@ -1,0 +1,111 @@
+IRISENSE 高性能引擎技术白皮书 2.0
+IRISENSE 高性能引擎技术白皮书 2.0：从百份百合规到 TechEmpower Tier 1 巅峰冲刺
+本白皮书承接 IRIS 核心验证准确率达到 100%（全面通过 Draft 2020-12 慢路径兜底）的技术节点，详细规划向极限算力、跨语言零拷贝传输及全球第一大 Web 后端榜单 TechEmpower 冲刺的完整架构蓝图与硬核技术栈。
+
+一、 执行摘要与八月中旬冲榜战略
+为了在 2026 年 8 月中旬成功攻占 TechEmpower（TFB）Continuous Results 看板的 Tier 1 榜首，团队将采取“三步走”的不对称作战战略。通过将 IRIS 从纯粹的“通用 JSON 校验器”逆向武器化为“特异化 JIT 序列化与反序列化双驱引擎”，并借助极致的网络外骨骼实现降维打击。
+
+战役阶段
+
+核心攻坚目标
+
+物理战术动作
+
+时间节点
+
+ 
+
+战役一：名分与纯算力局
+
+双杀 Bowtie 与 nativejson-benchmark
+
+编写测试马甲实现100%合规上榜；落地 JIT v0.2 与 SWAR 乘法移位完美哈希击碎 RapidJSON。
+
+2026年6月前
+
+战役二：物理传送带
+
+手搓 SPSC 共享内存无锁环形缓冲区
+
+利用强力内存屏障和缓存行隔离，攻克 ARM 弱内存模型下的指令重排，实现跨语言纳秒级 IPC。
+
+2026年7月上旬
+
+战役三：换心上市
+
+Drogon 框架深度融合与 TFB 冲榜
+
+切除 Drogon 原生的 jsoncpp 毒瘤，注入 IRIS 特异化机器码序列化引擎，直通 TCP 发送缓冲区。
+
+2026年8月中旬
+
+二、 Mac 开发环境兼容性与底层物理差异分析
+全程在 Mac 环境（基于 Apple Silicon ARM64 架构）下进行核心功能的研发是完全可行且极具优势的，但必须死死盯住由于物理架构切换带来的底层差异：
+
+弱内存模型红利：Apple Silicon 采用 ARM 弱内存模型。多线程无锁环形缓冲区（Ring Buffer）中的指令重排、内存可见性 Bug 会在 Mac 宿主机上暴漏得极其彻底。只要在 Mac 上通过了 ThreadSanitizer 压测，移植到 x86 强内存模型服务器上将坚如磐石。
+JIT 指令集双目标发射：打榜服务器通常采用 Linux x86_64（支持 AVX2/AVX-512）或云端 ARM64（如 AWS Graviton）。底层的 AsmJit 引擎必须在编译期通过宏分支同时支持发射两种物理机器码（ARM A64 与 x86-64 汇编）。
+网络层压测盲区：Mac 上的 Docker 运行在轻量级虚拟机内，存在显著的网卡虚拟化 I/O 损耗。在进行战役三（TechEmpower 极致网卡吞吐）调优时，本地 Mac 的压测数据仅作功能验证，最终的网络压测必须在一台原生的 Linux 裸金属服务器上进行物理对齐。
+三、 战役一：榨干硅基极限（JIT v0.2 与 SWAR 极速路由）
+本阶段核心目标是彻底替换掉 v0.1 的 Trampoline 慢跳转，实现无分支、无内存寻址的机器码直达技术。
+
+1. SWAR 乘法移位最小完美哈希（SWAR Multiply-Shift MPHF）
+针对静态已知、高度规整的 Key 集合，抛弃任何逐字节比对或复杂的树状遍历。当游标定位到 JSON 键（Key）边界时，直接实施 8 字节暴力加载（SWAR Read）：
+
+// 将前8字节（包含引号与可能冒号的特征）直接强转并加载至 64 位通用寄存器
+mov rax, qword ptr [Buffer_Cursor]
+// 注入 AOT 编译期通过暴力穷举算出的神奇魔数素质
+imul rax, MAGIC_PRIME              
+// 精准右移，直接提取高 6 位，将哈希空间无碰撞映射到 0~63 数组索引
+shr rax, 58                        
+
+2. 间接跳转与落地后的“幽灵防线”
+通过哈希索引，指令指针利用间接跳转 `jmp [r10 + rax * 8]` 瞬间跃迁至专属特异化校验块。为了防止外部恶意输入构造的“幽灵 Key”发生哈希碰撞，跳入特定块后的首要动作是建立物理硬核比对防线：
+
+.block_42_handling:
+ mov rcx, qword ptr [Buffer_Cursor]
+ cmp rcx, EXPECTED_FIELD_CONSTANT  // 精确验证当前Buffer里是不是真正的 "age":
+ jne .ghost_key_fallback           // 比对失败，直接触发幽灵降级协议
+ // 比对成功，执行“阅后即焚”状态位翻转与数据提取
+
+3. 流水线阅后即焚（Liveness Analysis 与通用寄存器位图状态机）
+对于单层巨型 Schema（如含有 50 个字段的对象），抛弃传统的内存对象分配。利用一个 64 位整型寄存器（如 `rbx`）充当“必填字段追踪掩码位图（Required Mask）”。进入专属校验块通过后，使用极其快速的无分支位运算指令将对应 Bit 翻转为 0。当遇到对象尾部 `}` 时，仅需一条指令 `test rbx, rbx`，若不为 0 则代表字段残缺，直接抛出异常，实现绝对零内存分配的流式清洗。
+
+四、 战役二：铺设跨语言物理传送带（Lock-free Ring Buffer IPC）
+为了让下游的 Python/Java/Node.js 微服务能够享受到 C++ 纯物理扫描的红利，必须切断缓慢的系统内核本地网络套接字通信（Unix Domain Socket/TCP），搭建基于操作系统共享内存（Shared Memory）的极速无锁环形缓冲区。
+
+1. 内存层拓扑与零拷贝压铸
+使用 `shm_open` 与 `mmap` 在 Linux/macOS 虚拟文件系统开辟内存特区。C++ 作为生产者顺着传送带滚动，在 JIT 校验通过的唯一一次内存扫描中，直接按照 FlatBuffers / Apache Arrow 的内存布局，使用 SIMD 向量寄存器将合法字段“压铸”进共享内存，供上游高级语言无需任何 `json.loads()` 即可实现地址偏移量直接读取。
+
+2. 降服 ARM 弱内存模型：Acquire-Release 语义
+在不加锁（Lock-free）的高并发环境下，为了镇压 CPU 的乱序执行（Out-of-Order），必须强行锁定内存屏障。C++ 生产者更新写指针（Tail）与高级语言消费者更新读指针（Head）时，必须精准施放内存序指令：
+
+// C++ 生产者发布数据到环形缓冲区，禁止任何数据写入被重排到指针更新之后
+tail_ptr.store(next_tail, std::memory_order_release);
+
+// Python/Java 消费者读取写指针，禁止任何后续读取动作被重排到指针确认之前
+uint64_t current_tail = tail_ptr.load(std::memory_order_acquire);
+
+3. 物理级防御：Cache Line Padding 与防伪共享
+为了防止读指针（Head）和写指针（Tail）因距离太近而落入 CPU 的同一个缓存行（Cache Line，Mac 及高端服务器通常为 64 字节或 128 字节），引发灾难性的核心争夺（False Sharing），在 C++ 无锁环形队列定义中，强制施加硬件对齐：
+
+alignas(128) std::atomic<uint64_t> head_pointer;
+// 强行用无用字节撑开至少128字节的物理隔离带
+alignas(128) std::atomic<uint64_t> tail_pointer;
+
+五、 战役三：TechEmpower 巅峰冲刺（终极换心手术）
+在 7 月中旬底座完全稳固后，全员进入 TFB 打榜备战。战略采用“借壳上市”法，Fork 目前网络 I/O 做到物理极限的 C++ 顶级框架 Drogon，将其原生的慢速 `jsoncpp` 组件彻底剥离。
+
+1. JIT 序列化的“逆向武器化”
+由于 TechEmpower 的 JSON 赛道只测试 Server 端向 Client 端发送 JSON 的吞吐能力，IRIS 必须调用 AOT 引擎，针对指定的 `{"message":"Hello, World!"}` 静态结构，在冷启动阶段直接将该字符串的机器码布局硬编码写入 JIT 代码块。当 HTTP 路由 `/json` 被触发时，无需任何对象构建、无运行时字段拼接，直接以最暴力的几条内存拷贝指令，零拷贝注入 Drogon 的 TCP 发送缓冲区（Send Buffer），彻底解放 CPU 开销。
+
+2. 极限网络架构调优规范
+Thread-per-Core（单线程单核绑定）：严格限制多线程上下文切换。每个工作线程完全独立绑定一个物理 CPU 核心，各自维持一个无锁的 `epoll` 事件循环（Event Loop）。
+内核级端口复用：开启 `SO_REUSEPORT`，让 16 个以上的核心直接在 Linux 内核层无缝分发涌入的 HTTP 万兆连接，彻底干掉用户态锁争抢。
+定时器无损时间戳：TFB 强制要求 HTTP 响应头携带 `Date` 时间戳。严禁每个请求调用系统 `time()` 函数导致内核态塌陷。必须开辟单条独立的底层计时器线程，每秒更新一次全局时间字符串，工作线程只需对其进行无脑的原子指针读取。
+六、 工业级铁血质量验收标准
+每一个战役交付的代码，都必须通过最高规格的破坏性测试：
+
+合规性验收：必须在本地通过 `bowtie run` 指令，跑满 1295 个最偏门刁钻的官方用例，达成 100% 绿灯。
+安全性验收：必须挂载 Google `libFuzzer` 或 `AFL++` 实施持续 24 小时的畸形脏数据轰炸，达成 0 崩溃、0 段错误。
+并发性验收：在 Mac（ARM 弱内存序环境）上，启动多线程疯狂吞吐 1 亿条自增 ID 数据块，且强制开启 `ThreadSanitizer (TSan)`，必须达成 0 Data Race 警告。
+零抖动验收：挂载 Java/Python 端监控，在吞吐 10GB 海量流量期间，高级语言堆内存分配速率曲线必须为绝对直线，GC 触发率必须为绝对零。

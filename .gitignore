@@ -1,0 +1,13 @@
+build/
+build-*/
+.cache/
+.DS_Store
+*.o
+*.a
+*.dylib
+*.so
+*.dSYM/
+compile_commands.json
+.vscode/
+.idea/
+.cursor/

@@ -1,0 +1,96 @@
+name: bench
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Corpus size"
+        default: "1000000"
+      iters:
+        description: "Iterations"
+        default: "3"
+
+jobs:
+  build-and-bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Print runner info
+        run: |
+          uname -a
+          c++ --version || true
+          cmake --version
+
+      - name: Configure (Release, simdjson on)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DIRIS_BUILD_SIMDJSON=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Phase 1 SIMD throughput
+        run: ./build/examples/phase1_demo 256
+
+      - name: Compare IRIS / simdjson / ajv (flat + nested)
+        env:
+          COUNT: ${{ github.event.inputs.count || '1000000' }}
+          ITERS: ${{ github.event.inputs.iters || '3' }}
+        run: ./scripts/compare.sh "$COUNT" "$ITERS"
+
+      - name: Bowtie protocol smoke test
+        run: |
+          printf '%s\n' \
+            '{"cmd":"start","version":1}' \
+            '{"cmd":"dialect","dialect":"https://json-schema.org/draft/2020-12/schema"}' \
+            '{"cmd":"run","seq":1,"case":{"description":"basic","schema":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]},"tests":[{"description":"ok","instance":{"x":1},"valid":true},{"description":"missing","instance":{},"valid":false},{"description":"wrong","instance":{"x":"s"},"valid":false}]}}' \
+            '{"cmd":"stop"}' | ./build/bench/bowtie_iris
+
+      - name: Install RE2 (slow-path regex engine)
+        if: runner.os == 'macOS'
+        run: brew install re2
+      - name: Install RE2 (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libre2-dev
+
+      - name: Re-configure with RE2 (rebuild slow-path)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j --target iris conformance
+
+      - name: JSON Schema Test Suite conformance
+        run: |
+          git clone --depth 1 https://github.com/json-schema-org/JSON-Schema-Test-Suite.git .test-suite
+          ./build/bench/conformance .test-suite/tests/draft2020-12 | tee conformance.txt
+          # 双引擎接入后准确率门槛上调到 99%（attempted），raw 不低于 88%
+          awk '/^attempted/ { gsub("%","",$7); rate=$7+0; print "[ci] attempted=" rate "%"; if (rate < 99.0) { print "FAIL: attempted pass rate below 99%"; exit 1 } }' conformance.txt
+          awk '/^raw/       { gsub("%","",$7); rate=$7+0; print "[ci] raw=" rate "%";       if (rate < 88.0) { print "FAIL: raw pass rate below 88%";       exit 1 } }' conformance.txt
+
+      - name: Configure + build JIT variant
+        run: |
+          cmake -S . -B build-jit -DCMAKE_BUILD_TYPE=Release -DIRIS_ENABLE_JIT=ON -DIRIS_BUILD_SIMDJSON=OFF
+          cmake --build build-jit -j
+
+      - name: Run JIT-enabled validate
+        run: |
+          ./build-jit/bench/iris_validate .corpus/flat/schema.json   .corpus/flat/data.jsonl   3
+          ./build-jit/bench/iris_validate .corpus/nested/schema.json .corpus/nested/data.jsonl 3

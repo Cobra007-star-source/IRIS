@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "name":   {"type": "string",  "minLength": 1,  "maxLength": 64},
+    "age":    {"type": "integer", "minimum": 0,    "maximum": 200},
+    "email":  {"type": "string",  "minLength": 3,  "maxLength": 128},
+    "active": {"type": "boolean"}
+  },
+  "required": ["name", "age"],
+  "additionalProperties": false
+}

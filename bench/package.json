@@ -1,0 +1,14 @@
+{
+  "name": "iris-bench-ajv",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "ajv reference benchmark for IRIS",
+  "scripts": {
+    "bench": "node ajv_bench.mjs",
+    "noop": "echo IRIS bench is driven by ../scripts/compare.sh"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
+  }
+}
