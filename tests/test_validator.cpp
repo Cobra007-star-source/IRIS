@@ -11,10 +11,10 @@ namespace {
 iris::Validator make_basic() {
     using namespace iris;
     std::array<FieldSpec, 4> fields = {{
-        {"name",   kTypeString,  .required = true,  .min_string_len = 1, .max_string_len = 16},
-        {"age",    kTypeInteger, .required = true,  .min_int = 0,        .max_int = 200},
-        {"email",  kTypeString,  .required = false, .min_string_len = 3, .max_string_len = 64},
-        {"active", kTypeBoolean, .required = false},
+        {"name",   kTypeString,  true,  1,  16, 0,         200},
+        {"age",    kTypeInteger, true,  0,  0,  0,         200},
+        {"email",  kTypeString,  false, 3,  64, 0,         200},
+        {"active", kTypeBoolean, false, 0,  0,  0,         200},
     }};
     auto built = compile_schema(fields, false);
     if (!built.ok) {
@@ -91,8 +91,8 @@ IRIS_TEST(validate_nested_value_skipped) {
     // schema 不允许 active 之外的字段，但允许的字段值如果是对象时，会被 skip_balanced 跳过
     using namespace iris;
     std::array<FieldSpec, 2> fields = {{
-        {"name", kTypeString, .required = true, .max_string_len = 16},
-        {"meta", kTypeObject, .required = false},
+        {"name", kTypeString, true,  0, 16, 0, 200},
+        {"meta", kTypeObject, false, 0,  0, 0, 200},
     }};
     auto b = compile_schema(fields, false);
     Validator vv(std::move(b.schema));

@@ -31,3 +31,8 @@ perf.data*
 *.pcap
 flamegraph*.svg
 /tmp/perf-*.map
+
+# Secrets / SSH keys — never commit
+*.pem
+*.key
+id_rsa*
