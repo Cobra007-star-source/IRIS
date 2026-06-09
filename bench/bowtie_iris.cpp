@@ -1,33 +1,46 @@
 // =============================================================================
 // bench/bowtie_iris.cpp
 //
-// Bowtie (https://docs.bowtie.report) JSON-RPC stdio harness driver.
+// Bowtie (https://docs.bowtie.report) IHOP stdio harness for IRIS.
 //
-// Bowtie 协议：每行 stdin 一个 JSON 命令对象，每行 stdout 一个 JSON 响应对象。
+// IHOP = input -> harness -> output protocol. Bowtie writes one JSON command
+// object per line on stdin; the harness writes one JSON response object per
+// line on stdout. Commands:
 //
-//   {"cmd":"start", "version":1}
-//   → {"version":1, "implementation":{...}}
+//   {"cmd":"start","version":1}
+//     -> {"version":1,"implementation":{...}}
 //
-//   {"cmd":"dialect", "dialect":"https://json-schema.org/draft/2020-12/schema"}
-//   → {"ok":true}
+//   {"cmd":"dialect","dialect":"https://json-schema.org/draft/2020-12/schema"}
+//     -> {"ok":true}            (we configured ourselves for that implicit dialect)
 //
-//   {"cmd":"run", "seq":N, "case":{"description":"...", "schema":{...}, "tests":[{"instance":..., "valid":bool}, ...]}}
-//   → {"seq":N, "results":[{"valid":bool}, ...]}
+//   {"cmd":"run","seq":N,"case":{
+//        "description":"...",
+//        "schema":{...},
+//        "registry":{ "<uri>":{...}, ... },   // extra docs for $ref resolution
+//        "tests":[{"instance":...}, ...]
+//   }}
+//     -> {"seq":N,"results":[{"valid":bool} | {"errored":true,...}, ...]}
 //
-//   {"cmd":"stop"}
-//   → exit
+//   {"cmd":"stop"} -> exit 0
 //
-// IRIS 的 Bowtie 集成是 Phase 4 的核心交付，目的是出现在 Bowtie 报告页：
-//   https://bowtie.report
+// CRITICAL DESIGN NOTES (why this harness reproduces IRIS's 100% conformance):
 //
-// 当前限制（详见响应 implementation block）：
-//   - dialect 仅声明支持 draft-2020-12 的语义子集
-//   - 不支持的关键字会让 schema 编译失败，driver 回应 "skipped"
+//   1. Entry point is Validator::from_schema_json, NOT compile_schema_from_json.
+//      from_schema_json auto-routes fast<->slow: it tries the SoA fast path and
+//      falls back to the recursive draft-2020-12 slow interpreter for anything
+//      the fast path rejects. The fast-path-only entry point would report most
+//      cases as unsupported and show a misleadingly poor score on bowtie.report.
+//
+//   2. $ref resolution uses case.registry. Bowtie ships every remote document a
+//      case may reference inline in `case.registry` (uri -> schema). We register
+//      each one via add_remote_document so the slow path can resolve them. A
+//      harness that ignores the registry fails every $ref/remote test.
+//
+//   3. One Validator is built per case and reused (read-only) across that case's
+//      tests -- no recompile per instance.
 // =============================================================================
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
-#include <sstream>
 #include <string>
 
 #include "iris/json_reader.hpp"
@@ -35,7 +48,12 @@
 
 namespace {
 
-// 将 JsonValue 序列化回 JSON 文本（仅 schema/instance 用，无 unicode escape 优化）
+constexpr const char* kDialect2020 =
+    "https://json-schema.org/draft/2020-12/schema";
+
+// Serialize a JsonValue back to compact JSON text. Used to feed schemas,
+// instances and registry documents into IRIS (which parses from text), and to
+// echo the opaque `seq` value verbatim.
 void serialize(const iris::JsonValue& v, std::string& out);
 
 void serialize_string(std::string_view s, std::string& out) {
@@ -109,28 +127,56 @@ void write_line(const std::string& s) {
     std::fflush(stdout);
 }
 
-void on_start() {
+void on_start(const iris::JsonValue& cmd) {
+    // version must be the protocol version we speak (1). Bowtie may bump this;
+    // we still answer so the operator sees the mismatch rather than a silent
+    // hang, but a future-incompatible version is the operator's call.
+    (void)cmd;
     write_line(R"({"version":1,"implementation":{)"
-               R"("name":"iris",)"
                R"("language":"cpp",)"
-               R"("homepage":"https://github.com/iris-validator/iris",)"
-               R"("issues":"https://github.com/iris-validator/iris/issues",)"
-               R"("source":"https://github.com/iris-validator/iris",)"
-               R"("dialects":["https://json-schema.org/draft/2020-12/schema"])"
+               R"("name":"iris",)"
+               R"("version":"0.1.0",)"
+               R"("homepage":"https://github.com/Cobra007-star-source/IRIS",)"
+               R"("issues":"https://github.com/Cobra007-star-source/IRIS/issues",)"
+               R"("source":"https://github.com/Cobra007-star-source/IRIS",)"
+               R"("documentation":"https://github.com/Cobra007-star-source/IRIS",)"
+               R"("dialects":["https://json-schema.org/draft/2020-12/schema"],)"
+               R"("links":[{"description":"license","url":"https://www.gnu.org/licenses/agpl-3.0.html"}])"
                "}}");
 }
 
+// The dialect command sets the IMPLICIT dialect (how to treat schemas with no
+// $schema). IRIS's slow path defaults to draft-2020-12, which is the only
+// dialect we advertise, so we acknowledge it. Anything else: ok:false.
 void on_dialect(const iris::JsonValue& cmd) {
-    (void)cmd;
-    write_line(R"({"ok":true})");
+    const auto* d = cmd.find("dialect");
+    const bool ok = d && d->is_string() && d->as_string() == kDialect2020;
+    write_line(ok ? R"({"ok":true})" : R"({"ok":false})");
 }
 
-// 主请求处理：run 命令包含一个 case，多条 tests。
-// 每条 test 给出 instance 与期望 valid，driver 返回 IRIS 的实际判定。
+// Emit a results array whose every entry is a caught "errored" item carrying a
+// short message. Used when a case's schema cannot be compiled at all -- honest
+// signal to Bowtie (preferred over silently skipping).
+void emit_errored_results(std::string& out, std::size_t n, std::string_view msg) {
+    out += "\"results\":[";
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i) out.push_back(',');
+        out += R"({"errored":true,"context":{"message":)";
+        std::string m(msg);
+        if (m.size() > 200) m.resize(200);
+        serialize_string(m, out);
+        out += "}}";
+    }
+    out += "]}";
+}
+
 void on_run(const iris::JsonValue& cmd) {
     std::string out = "{";
-    const auto* seq = cmd.find("seq");
-    if (seq) { out += "\"seq\":"; serialize(*seq, out); out += ","; }
+    if (const auto* seq = cmd.find("seq")) {
+        out += "\"seq\":";
+        serialize(*seq, out);
+        out += ",";
+    }
 
     const auto* case_v = cmd.find("case");
     if (!case_v || !case_v->is_object()) {
@@ -145,37 +191,45 @@ void on_run(const iris::JsonValue& cmd) {
         write_line(out);
         return;
     }
+    const std::size_t n_tests = tests_v->as_array().size();
 
-    // 编译 schema
-    std::string schema_str; serialize(*schema_v, schema_str);
-    auto built = iris::compile_schema_from_json(schema_str);
+    // Build the validator once for this case (auto fast<->slow routing).
+    std::string schema_str;
+    serialize(*schema_v, schema_str);
+    iris::ValidatorBuild vb;
+    iris::Validator validator = iris::Validator::from_schema_json(schema_str, vb);
+    if (!vb.ok) {
+        emit_errored_results(out, n_tests, vb.diagnostic);
+        write_line(out);
+        return;
+    }
+
+    // Feed the inline registry to the slow path so $ref can resolve. Only the
+    // slow path owns a document store; if the case is pure fast path there are
+    // no $refs to resolve, so a missing registry is harmless.
+    if (const auto* reg = case_v->find("registry");
+        reg && reg->is_object() && validator.has_slow_path()) {
+        for (const auto& [uri, doc] : reg->as_object()) {
+            std::string doc_str;
+            serialize(doc, doc_str);
+            validator.add_remote_document(uri, doc_str);
+        }
+    }
 
     out += "\"results\":[";
-    bool first_r = true;
-    for (auto& t : tests_v->as_array()) {
-        if (!first_r) out += ",";
-        first_r = false;
-        if (!built.ok) {
-            // schema 编译失败 → Bowtie 期望 implementation 报 skipped
-            out += R"({"skipped":true,"message":")";
-            // 截断长 diagnostic
-            std::string msg = built.diagnostic;
-            if (msg.size() > 120) msg.resize(120);
-            for (char c : msg) {
-                if (c == '"' || c == '\\') out.push_back('\\');
-                out.push_back(c);
-            }
-            out += "\"}";
+    bool first = true;
+    for (const auto& t : tests_v->as_array()) {
+        if (!first) out.push_back(',');
+        first = false;
+        const auto* inst = t.find("instance");
+        if (!inst) {
+            out += R"({"errored":true,"context":{"message":"instance missing"}})";
             continue;
         }
-        const auto* inst = t.find("instance");
-        if (!inst) { out += R"({"errored":true,"context":{"message":"instance missing"}})"; continue; }
-        std::string inst_str; serialize(*inst, inst_str);
-        iris::Validator v(iris::CompiledSchema{std::move(built.schema)});
-        auto r = v.validate(inst_str);
+        std::string inst_str;
+        serialize(*inst, inst_str);
+        const auto r = validator.validate(inst_str);
         out += r.ok() ? R"({"valid":true})" : R"({"valid":false})";
-        // Validator 会消费 schema；重新编译以便下一个 test 用同样的 schema
-        built = iris::compile_schema_from_json(schema_str);
     }
     out += "]}";
     write_line(out);
@@ -202,13 +256,12 @@ int main() {
         }
         const std::string& cmd = cmd_v->as_string();
         if (cmd == "start") {
-            on_start();
+            on_start(p.value);
         } else if (cmd == "dialect") {
             on_dialect(p.value);
         } else if (cmd == "run") {
             on_run(p.value);
         } else if (cmd == "stop") {
-            write_line("{}");
             return 0;
         } else {
             write_line(R"({"error":"unknown cmd"})");

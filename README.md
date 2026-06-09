@@ -182,3 +182,20 @@ ctest --test-dir build --output-on-failure
 3. **`/plaintext` + `/json`**：拿下两个网络-bound 赛道，配 Dockerfile + `benchmark_config.json` + `wrk` 压测
 4. **裸金属调优**：`perf stat`（IPC / L1-dcache / iTLB）+ flamegraph + perf map（最终成绩以 Linux 物理机为准）
 5. **第二滩头（延后）**：异步 Postgres 驱动 → `/db` `/queries` `/updates`；`/fortunes`（DB + SIMD XSS 转义 + 模板）
+
+## 7. Bowtie（第三方合规核验）
+
+`bench/bowtie_iris.cpp` 是 [Bowtie](https://bowtie.report) 的 IHOP stdio harness，
+走 `Validator::from_schema_json`（快↔慢自动降级）并消费 `case.registry` 解析 `$ref`。
+本地可在无 Docker / 无 bowtie CLI 下用 `bench/bowtie_local_check.py` 复现
+**1295/1295 = 100%**。打包与提 PR 步骤见 [`bowtie/README.md`](bowtie/README.md)。
+
+```bash
+python3 bench/bowtie_local_check.py   # → raw pass rate: 1295/1295 = 100.00%
+```
+
+## License
+
+IRIS is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0).
+See [`LICENSE`](LICENSE). Network use is distribution: anyone who runs a modified
+IRIS as a service must make the corresponding source available under the same terms.
