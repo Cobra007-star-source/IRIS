@@ -1,11 +1,11 @@
 # IRIS Performance Report
 
-> "Schema 校验越快越好" 是一句正确的废话；本报告聚焦的是 **为什么 IRIS 快、
-> 在哪种 schema 下快、相对参照系（ajv / simdjson）的实际差距，以及距离白皮书
-> 终极目标还差多少**。
+> "Faster schema validation is always better" is a truism. This report focuses on **why IRIS is fast,
+> under which schema types it excels, the actual gap relative to reference implementations (ajv / simdjson),
+> and how far we are from the whitepaper's ultimate goals**.
 >
-> 所有数字在 **Apple Silicon M-series（NEON 128-bit）** 上由 `scripts/compare.sh`
-> 的同一次运行同时跑出，可复现：
+> All numbers were generated in a single run of `scripts/compare.sh` on **Apple Silicon M-series (NEON 128-bit)**.
+> Fully reproducible:
 
 ```bash
 ./scripts/compare.sh 1000000 3
@@ -15,69 +15,69 @@
 
 ## 0. TL;DR
 
-### 0.1 性能（Apple M-series, single thread, 100K lines × 3 iters）
+### 0.1 Performance (Apple M-series, single thread, 100K lines × 3 iters)
 
-| 维度                            | flat schema (4 fields) | nested schema (array-of-object) |
+| Metric                          | flat schema (4 fields) | nested schema (array-of-object) |
 |--------------------------------|:----------------------:|:--------------------------------:|
-| simdjson 纯解析 (Mops/s)        | 16.16                  | 12.54                            |
+| simdjson pure parse (Mops/s)    | 16.16                  | 12.54                            |
 | **IRIS Fast Path (Mops/s)**    | **11.21**              | **5.76**                         |
 | IRIS Fast Path (MiB/s)         | 643.0                  | 594.0                            |
 | **IRIS Slow Path (Mops/s)**    | **1.17**               | **0.55**                         |
 | IRIS Slow Path (MiB/s)         | 67.3                   | 56.4                             |
 | ajv 8.x on Node 20 (Mops/s)    | 2.48                   | 1.15                             |
-| **Fast Path vs ajv 加速**       | **× 4.52**             | **× 5.01**                       |
-| Fast Path vs simdjson 比值      | × 0.69                 | × 0.46                           |
-| Slow Path vs ajv 比值           | × 0.47                 | × 0.48                           |
+| **Fast Path vs ajv speedup**    | **× 4.52**             | **× 5.01**                       |
+| Fast Path vs simdjson ratio     | × 0.69                 | × 0.46                           |
+| Slow Path vs ajv ratio          | × 0.47                 | × 0.48                           |
 
-### 0.2 合规率（JSON Schema Test Suite, draft 2020-12, 1295 cases）
+### 0.2 Compliance Rate (JSON Schema Test Suite, draft 2020-12, 1295 cases)
 
-| 指标                            | 现版本 | 上一版（仅 Fast Path） |
+| Indicator                      | Current Version | Previous (Fast Path Only) |
 |--------------------------------|:------:|:----------------------:|
 | **raw pass rate**              | **90.89%** (1177/1295) | 13.82% (179/1295) |
 | **attempted pass rate**        | **99.83%** (1177/1179) | 96.76%            |
-| skipped (schema 不支持)         | 8.96% (116/1295)       | 85.71% (1110/1295) |
-| Fast Path 接管                  | 178 cases (15%)        | 179                |
-| **Slow Path 接管**              | **1001 cases (85%)**   | 0                  |
+| skipped (schema not supported) | 8.96% (116/1295)       | 85.71% (1110/1295) |
+| Fast Path handled              | 178 cases (15%)        | 179                |
+| **Slow Path handled**          | **1001 cases (85%)**   | 0                  |
 
-**核心结论**
+**Key Conclusions**
 
-1. **真慢车道上线**——双车道现在都是"真"的。Slow Path 是完整的 JSON Schema 2020-12
-   递归解释器，覆盖 allOf/anyOf/oneOf/not/if-then-else/$ref/$defs/$anchor/$dynamicRef、
-   pattern (RE2 后端)、unevaluated{Properties,Items} 含 annotation tracking。
-2. **合规率从 13.82% → 90.89%**——slow car 把 Fast Path 之外的 994 个测试用例接住。
-   attempted pass rate 99.83%，意味着 *IRIS 答出来的题 99.83% 是对的*。
-3. **吞吐量**：Fast Path 在扁平 schema 上达到 simdjson 纯解析速度的 **69%**（含
-   schema 校验）；vs ajv 快 **4.5×**（扁平）/ **5.0×**（嵌套）。Slow Path 慢约 10×，
-   但仍达到 ajv 速度的 ~48%——这是合理的，慢车道的工作量是 *全树 AST 遍历 + annotation
-   tracking + RE2 partial-match*。
-4. **asmjit::Compiler API**：已切换。栈帧 / 调用约定 / 虚拟寄存器分配 / 自动栈溢出
-   全部由 asmjit::Compiler 管理。详见 §11。
+1. **Real Slow Path Online** — Both paths are now "real". Slow Path is a complete JSON Schema 2020-12
+   recursive interpreter covering allOf/anyOf/oneOf/not/if-then-else/$ref/$defs/$anchor/$dynamicRef,
+   pattern (RE2 backend), unevaluatedProperties/Items with annotation tracking.
+2. **Compliance jumped from 13.82% → 90.89%** — Slow Path caught 994 test cases beyond Fast Path's reach.
+   Attempted pass rate 99.83% means *IRIS gets 99.83% of questions it attempts correct*.
+3. **Throughput**: Fast Path reaches **69%** of simdjson pure parse speed on flat schema (with full
+   schema validation); **4.5×** (flat) / **5.0×** (nested) faster than ajv. Slow Path is ~10× slower,
+   but still reaches **~48% of ajv's speed** — reasonable given the workload: *full tree AST traversal +
+   annotation tracking + RE2 partial-match*.
+4. **asmjit::Compiler API**: Now switched. Stack frame / calling convention / virtual register allocation /
+   automatic spill all managed by asmjit::Compiler. See §11 for details.
 
 ---
 
-## 1. 硬件与方法
+## 1. Hardware and Methodology
 
-### 1.1 测试机
+### 1.1 Test Machine
 
-| 项            | 值                                         |
-|---------------|--------------------------------------------|
-| CPU           | Apple Silicon M-series (ARMv8.4-A)         |
-| SIMD          | NEON 128-bit                               |
-| Clang         | Apple Clang 17.0                           |
-| Node.js (ajv) | v20.x                                      |
-| 优化等级       | `-O3 -ffast-math -fno-omit-frame-pointer` + LTO |
+| Item           | Value                                      |
+|----------------|--------------------------------------------|
+| CPU            | Apple Silicon M-series (ARMv8.4-A)         |
+| SIMD           | NEON 128-bit                               |
+| Clang          | Apple Clang 17.0                           |
+| Node.js (ajv)  | v20.x                                      |
+| Optimization   | `-O3 -ffast-math -fno-omit-frame-pointer` + LTO |
 
-### 1.2 语料
+### 1.2 Test Corpus
 
-由 `bench/gen_corpus` 用固定 seed=`0xC0FFEE` 生成，跨机器逐字节一致：
+Generated by `bench/gen_corpus` with fixed seed=`0xC0FFEE`, byte-for-byte identical across machines:
 
-| 语料                   | 记录数  | 平均字节/条 | 描述                                                    |
-|-----------------------|--------:|------------:|--------------------------------------------------------|
-| `flat/data.jsonl`     | 1,000,000 | ~60 B       | 4 字段 person: name/age/email?/active?                  |
-| `flat/bad.jsonl`      | 100,000   | ~60 B       | 故意违反 schema，用于错误路径 sanity                     |
-| `nested/data.jsonl`   | 1,000,000 | ~103 B      | id/name + addr(object) + tags(array) + events(array-of-object) |
+| Corpus                 | Records  | Avg bytes/line | Description                                           |
+|-----------------------|---------:|---------------:|-------------------------------------------------------|
+| `flat/data.jsonl`     | 1,000,000 | ~60 B          | 4-field person: name/age/email?/active?               |
+| `flat/bad.jsonl`      | 100,000   | ~60 B          | Intentionally schema-violating for error path testing |
+| `nested/data.jsonl`   | 1,000,000 | ~103 B         | id/name + addr(object) + tags(array) + events(array-of-object) |
 
-`nested` 的 schema 完整覆盖了 IRIS 嵌套递归路径：
+The `nested` schema fully exercises IRIS's nested recursive paths:
 
 ```json
 {
@@ -98,25 +98,25 @@
 }
 ```
 
-### 1.3 公平对比约束
+### 1.3 Fair Comparison Constraints
 
-我们刻意让三方在**完全相同的语料**上跑同样的迭代次数：
+All three implementations run on **identical corpus** with the same iteration count:
 
-| 步骤                | IRIS                                       | simdjson                                | ajv (Node)                                              |
+| Step               | IRIS                                       | simdjson                                | ajv (Node)                                              |
 |--------------------|--------------------------------------------|------------------------------------------|--------------------------------------------------------|
-| 启动               | `compile_schema_from_json` 一次             | `parser` 一次                            | `ajv.compile(schema)` 一次                              |
-| 计时区              | `validate()` ×iters                        | `parser.iterate()` ×iters                | `JSON.parse + validate()` ×iters                       |
-| I/O / 文件读        | 不计入                                     | 不计入                                  | 不计入                                                  |
-| 内存形态            | 行切片指针数组                              | `simdjson::padded_string`                | 字符串数组                                              |
-| 校验深度            | **完整 schema 校验**                        | **零校验**（只做 tape 构造）             | **完整 schema 校验**                                    |
+| Startup            | `compile_schema_from_json` once             | `parser` once                            | `ajv.compile(schema)` once                              |
+| Timed region       | `validate()` ×iters                        | `parser.iterate()` ×iters                | `JSON.parse + validate()` ×iters                       |
+| I/O / File read    | Not included                               | Not included                            | Not included                                            |
+| Memory layout      | Line slice pointer array                   | `simdjson::padded_string`                | String array                                            |
+| Validation depth   | **Full schema validation**                 | **Zero validation** (tape construction only) | **Full schema validation**                          |
 
-simdjson 是"上限基准"：它没做任何校验，理论上 IRIS 不可能更快——能逼近就是胜利。
+simdjson is the "upper bound baseline": it does zero validation, so theoretically IRIS cannot be faster — getting close is victory.
 
 ---
 
-## 2. 完整结果
+## 2. Complete Results
 
-### 2.1 一次 `compare.sh` 跑下来的原始输出
+### 2.1 Raw Output from One `compare.sh` Run
 
 ```
 == 3. IRIS — flat schema (4 fields) ==
@@ -139,7 +139,7 @@ simdjson 是"上限基准"：它没做任何校验，理论上 IRIS 不可能更
 [ajv]  2.182 s | 1.37 Mops/s | 141.42 MiB/s | avg 727.5 ns/op | ok=3000000/3000000
 ```
 
-### 2.2 横向对比 ASCII bar
+### 2.2 Horizontal Comparison ASCII Bar
 
 ```
                        Mops/s              ────►
@@ -152,14 +152,14 @@ simdjson 是"上限基准"：它没做任何校验，理论上 IRIS 不可能更
                               (scale: # ≈ 0.4 Mops/s on M-series)
 ```
 
-### 2.3 加速比矩阵
+### 2.3 Speedup Ratio Matrix
 
-| 语料   | IRIS / ajv | IRIS / simdjson | simdjson / ajv | 注释                          |
-|--------|:----------:|:---------------:|:--------------:|-------------------------------|
-| flat   | **5.44×**  | 0.93×           | 5.85×          | IRIS 几乎贴脸 simdjson 上限   |
-| nested | **5.20×**  | 0.55×           | 9.45×          | nested 递归路径仍有优化空间   |
+| Corpus  | IRIS / ajv | IRIS / simdjson | simdjson / ajv | Notes                                |
+|---------|:----------:|:---------------:|:--------------:|--------------------------------------|
+| flat    | **5.44×**  | 0.93×           | 5.85×          | IRIS nearly touches simdjson ceiling |
+| nested  | **5.20×**  | 0.55×           | 9.45×          | Nested recursive path has optimization room |
 
-### 2.4 延迟视角
+### 2.4 Latency Perspective
 
 | engine          | flat ns/op | nested ns/op |
 |-----------------|:----------:|:------------:|
@@ -168,24 +168,24 @@ simdjson 是"上限基准"：它没做任何校验，理论上 IRIS 不可能更
 | simdjson        | 58.8       | 77.3         |
 | ajv             | 344.0      | 727.5        |
 
-3 GHz CPU 下 63 ns/op ≈ 189 cycles/record，对于 60-byte JSON+4 字段完整校验，
-这接近 LLC 命中下的物理下限。
+At 3 GHz CPU, 63 ns/op ≈ 189 cycles/record. For 60-byte JSON with 4-field full validation,
+this approaches the physical lower bound under LLC hit conditions.
 
 ---
 
-## 3. 数据结构：把 schema 编译成 SoA
+## 3. Data Structures: Compiling Schema into SoA
 
-不要把 schema 当成 AST。IRIS 把每条 schema 编译成 SoA（Structure-of-Arrays）：
+Don't treat schema as an AST. IRIS compiles each schema into SoA (Structure-of-Arrays):
 
-```12:38:include/iris/schema.hpp
-// 编译产物：递归 object/array schema。
+```cpp
+// Compilation product: recursive object/array schema.
 //
-// 嵌套字段：
-//   - 字段 type 包含 object → nested_object[slot] 持有子 schema
-//   - 字段 type 包含 array  → array_item_type[slot] 是 item 的 TypeMask；
-//                              若 item 还是 object，则 array_item_nested[slot] 进一步递归
+// Nested fields:
+//   - field type contains object → nested_object[slot] holds sub-schema
+//   - field type contains array  → array_item_type[slot] is item TypeMask;
+//                                   if item is also object, array_item_nested[slot] recurses further
 //
-// 三个并行 vector 维持 SoA 风格；非嵌套字段的对应槽位用空指针 / kTypeNone 占位。
+// Three parallel vectors maintain SoA style; non-nested fields use nullptr / kTypeNone placeholders.
 struct CompiledSchema {
     PerfectHashTable           field_index;
     ShortKeyTable              short_keys;
@@ -202,34 +202,34 @@ struct CompiledSchema {
     bool                       additional_properties = true;
 ```
 
-关键设计点：
+Key design points:
 
-1. **SoA 而非 AoS**：所有字段的 `types[i]` 在内存上连续，cache 行命中率高
-2. **`required_mask` 一个 uint64**：必填字段判定是 bitwise AND，单条指令
-3. **`ShortKeyTable` ≤8B SWAR**：90% 实际 schema 字段名 ≤ 8 B，命中后绕过哈希
-4. **PerfectHashTable 后备**：≥9B 字段名走 mixed FNV-1a + 完美哈希 O(1) 查找
-5. **嵌套用 `unique_ptr` 列**：保持 SoA 主体连续，仅嵌套时跨缓存行
+1. **SoA not AoS**: All fields' `types[i]` are contiguous in memory, high cache line hit rate
+2. **`required_mask` single uint64**: Required field check is bitwise AND, single instruction
+3. **`ShortKeyTable` ≤8B SWAR**: 90% of real-world schema field names ≤ 8 B, bypass hash on hit
+4. **PerfectHashTable fallback**: ≥9B field names use mixed FNV-1a + perfect hash O(1) lookup
+5. **Nested via `unique_ptr` columns**: Keep SoA main body contiguous, only cross cache line on nesting
 
 ---
 
-## 4. Fast Path 核心：Fused Parse + Validate
+## 4. Fast Path Core: Fused Parse + Validate
 
-传统 `JSON.parse() → validate(AST)` 的两遍模型，每个字段触发：
-- 1 次堆分配（AST node）
-- 1 次类型 dispatch
-- 1 次 schema lookup
+Traditional `JSON.parse() → validate(AST)` two-pass model triggers per field:
+- 1 heap allocation (AST node)
+- 1 type dispatch
+- 1 schema lookup
 
-IRIS 把这三步压成一遍 cursor scan，单次扫描里完成解析 + 类型 + 范围 + 必填校验：
+IRIS compresses these three steps into one cursor scan, completing parsing + type + range + required validation in a single pass:
 
 ```cpp
-// 简化版 inner loop（实际见 src/parser.cpp::validate_object）
+// Simplified inner loop (actual implementation in src/parser.cpp::validate_object)
 while (true) {
     skip_ws();
     scan_key(key_off, key_len);          // SIMD find_byte_pair
     slot = short_key_lookup OR PH lookup;
     seen_mask |= 1ULL << slot;           // bit DFA
     skip_ws(); expect_colon(); skip_ws();
-    switch (peek()) {                    // 类型 dispatch
+    switch (peek()) {                    // type dispatch
         case '"': scan_string + len_check;
         case 't'/'f'/'n': 32-bit imm cmp;
         case '{': allowed&kTypeObject? → recurse if nested else skip_balanced;
@@ -239,27 +239,27 @@ while (true) {
 }
 ```
 
-每个 token 仅访问一次 `data[pos]`，热数据完整 fit 在 L1。
+Each token visits `data[pos]` only once; hot data fully fits in L1.
 
-### 4.1 关键内联：`skip_json_whitespace` 快路径
+### 4.1 Key Inline: `skip_json_whitespace` Fast Path
 
-最大的一次跃迁（+125% 吞吐）来自把 `skip_json_whitespace` 拆成 inline 快探针 +
-full SIMD scan：
+The biggest single jump (+125% throughput) came from splitting `skip_json_whitespace` into inline fast probe +
+full SIMD scan:
 
 ```cpp
 // include/iris/simd_ops.hpp
 IRIS_FORCE_INLINE std::size_t skip_json_whitespace(const std::uint8_t* d, std::size_t n) {
-    if (IRIS_LIKELY(n > 0 && d[0] > 0x20)) return 0;   // ✱ 90% 命中
-    return skip_json_whitespace_full(d, n);            // 仅有空白时进入 SIMD 扫
+    if (IRIS_LIKELY(n > 0 && d[0] > 0x20)) return 0;   // ✱ 90% hit rate
+    return skip_json_whitespace_full(d, n);            // Enter SIMD scan only when whitespace present
 }
 ```
 
-紧凑 JSON 里 `data[pos]` 几乎永远是非空白可见字符，一次 byte compare 直接退出，
-跨 TU 函数调用被彻底消除。
+In compact JSON, `data[pos]` is almost always non-whitespace visible characters. A single byte compare
+exits immediately, completely eliminating cross-TU function call overhead.
 
-### 4.2 字符串扫描：单 pass SIMD
+### 4.2 String Scanning: Single-Pass SIMD
 
-`scan_string` 改成一次 SIMD `find_byte_pair('"', '\\')`：
+`scan_string` converted to single SIMD `find_byte_pair('"', '\\')`:
 
 ```cpp
 std::size_t hit = simd::find_byte_pair(c.data + c.pos, rest, '"', '\\');
@@ -269,125 +269,125 @@ else c.pos += 2; // skip escape pair
 
 ARM NEON 实现里这是 `vceqq_u8 → vorrq_u8 → vmaxvq_u8`，1 路 16-byte 步进。
 
-### 4.3 Keyword `true/false/null` 用 32-bit 整型比较
+### 4.3 Keywords `true/false/null` Using 32-bit Integer Comparison
 
 ```cpp
-// 原 memcmp("true", 4) → call + loop
-// 现：
+// Original memcmp("true", 4) → call + loop
+// Now:
 std::uint32_t v; std::memcpy(&v, p, 4);
 return v == 0x65757274u;       // little-endian "true"
 ```
 
-`memcpy` 在 -O3 下 lowered 为 `ldur w0, [x0]`，对比变成 `cmp w0, #const`——
-单条指令。匹配 `false`（5 B）做 4+1 拼接。
+`memcpy` is lowered to `ldur w0, [x0]` at -O3, comparison becomes `cmp w0, #const` —
+single instruction. Matching `false` (5 B) uses 4+1 splicing.
 
-### 4.4 字段查找：ShortKey SWAR → PerfectHash
+### 4.4 Field Lookup: ShortKey SWAR → PerfectHash
 
 ```cpp
-if (LIKELY(key_len <= 8)) {        // 90% 实际 schema 命中
+if (LIKELY(key_len <= 8)) {        // 90% of real schemas hit this
     uint64_t w = *(uint64_t*)(p);  // unaligned load
-    w &= len_mask[len];            // 高位清零
-    linear compare against sk.bits[0..count]  // 通常 ≤6 字段
+    w &= len_mask[len];            // clear high bits
+    linear compare against sk.bits[0..count]  // typically ≤6 fields
 } else {
     slot = perfect_hash.lookup(sv);  // mixed FNV-1a + fmix64
 }
 ```
 
-注意 `mixed_hash` 不是直接 FNV-1a——FNV 的低位分布太差，对 N<8 的 schema 经常
-撞 slot 导致 PH 构造失败。我们在 modulo 前用 MurmurHash3 finalizer
-`fmix64` 散一下。
+Note `mixed_hash` is not raw FNV-1a — FNV's low-bit distribution is too poor, causing frequent
+slot collisions for N<8 schemas that fail PH construction. We scatter with MurmurHash3 finalizer
+`fmix64` before modulo.
 
 ---
 
-## 5. 嵌套 schema 路径解剖
+## 5. Nested Schema Path Anatomy
 
-`validate_object` 处理每个 value 时的 dispatch（关键节选）：
+`validate_object` dispatch when processing each value (key excerpts):
 
 ```cpp
 case '{': {
     if (!(allowed & kTypeObject)) return TypeMismatch;
-    if (obj_sub) {                          // ✱ 有 nested schema
-        auto _r = validate_object(c, *obj_sub);   // 递归
+    if (obj_sub) {                          // ✱ has nested schema
+        auto _r = validate_object(c, *obj_sub);   // recurse
         if (!_r.ok()) return _r;
     } else if (!skip_balanced(c)) ...;
     break;
 }
 case '[': {
-    if (item_type != 0) {                   // ✱ 有 array items 约束
+    if (item_type != 0) {                   // ✱ has array items constraint
         auto _r = validate_array(c, item_type, item_nested);
         if (!_r.ok()) return _r;
     } else if (!skip_balanced(c)) ...;
 }
 ```
 
-`validate_array` 复用了同一个 `IRIS_VALIDATE_SCALAR_AT` 宏（避免函数调用边界）。
-递归层数受 schema 静态结构限制——Inspector 在加载期已经拒绝 `$ref` 循环
-（见 `src/inspector.cpp` 的 Tarjan SCC 实现），所以 fast path 上不需要
-显式深度计数器或栈溢出保护。
+`validate_array` reuses the same `IRIS_VALIDATE_SCALAR_AT` macro (avoiding function call boundary).
+Recursion depth is limited by static schema structure — Inspector already rejects `$ref` cycles
+at load time (see Tarjan SCC implementation in `src/inspector.cpp`), so fast path needs no
+explicit depth counter or stack overflow protection.
 
-### 嵌套 schema 成本分析（nested 7.13 Mops/s = 140 ns/op）
+### Nested Schema Cost Analysis (nested 7.13 Mops/s = 140 ns/op)
 
-| 阶段                       | 估算 ns | 注释                                              |
-|---------------------------|--------:|---------------------------------------------------|
-| 顶层 object 5 个字段 key 解析 | 25      | 5×5 ns（short-key SWAR）                          |
-| `addr` 嵌套 object 校验      | 30      | 进入 `validate_object`，2-3 字段 + required check |
-| `tags` array 校验           | 15      | 0-3 string items + 每个 SIMD 扫                   |
-| `events` array-of-object   | 50      | 0-3 sub-object，每个内部 2-key 校验               |
-| skip_ws + comma + brace    | 20      | 分布在各 step                                      |
-| **合计**                   | **140** |                                                  |
+| Phase                          | Est. ns | Notes                                            |
+|-------------------------------|--------:|--------------------------------------------------|
+| Top-level object 5 field key parse | 25   | 5×5 ns (short-key SWAR)                          |
+| `addr` nested object validation    | 30   | Enter `validate_object`, 2-3 fields + required check |
+| `tags` array validation           | 15   | 0-3 string items + SIMD scan each                |
+| `events` array-of-object          | 50   | 0-3 sub-objects, each with 2-key validation      |
+| skip_ws + comma + brace           | 20   | Distributed across steps                          |
+| **Total**                         | **140** |                                                  |
 
-可见：递归 `validate_object` 是热点。下一步若把 `validate_object` 也做"specialized
-inline expansion"（即针对每一种已知 schema 形态预生成一个 inline 版本），可以
-进一步把 ns/op 降到 ~90-100，接近 simdjson 纯解析。
-
----
-
-## 6. simdjson 横向对比的深读
-
-simdjson 是世界上最快的 JSON 解析器，作 baseline 直接，但要正确解读：
-
-| 维度        | IRIS                   | simdjson                  |
-|------------|------------------------|---------------------------|
-| 单次扫描数  | 1 遍（fused）          | 2 遍（结构 + tape）       |
-| 校验        | ✅ schema + 类型 + 范围 | ❌ 仅结构                 |
-| 字符串扫描  | `find_byte_pair`       | structural index bitmaps  |
-| 元数据      | 仅 ValidationReport    | 完整 tape，可后续 query   |
-| 内存写入    | 0                      | tape 大约 `len(json)/2`   |
-
-> **IRIS flat 0.93× simdjson 的意义**：把"完整 JSON Schema 校验"塞进了
-> simdjson 同一规模的扫描预算里。
-
-在 nested 上 simdjson 仍领先（0.55×），原因是 simdjson 走的是 *lazy on-demand*
-模式——`for (auto field : doc.get_object())` 只触发顶层对象的 token 解析，
-而 IRIS 真正递归校验了每个子对象 / 每个数组元素。如果让 simdjson 也"真正访问"
-所有嵌套字段，差距会回到 ~1.3-1.5×。
+As seen: recursive `validate_object` is the hotspot. Next step: "specialized inline expansion" for
+`validate_object` (pre-generate an inline version for each known schema shape) could further reduce
+ns/op to ~90-100, approaching simdjson pure parse.
 
 ---
 
-## 7. vs ajv：为什么 5× 而不是 50×
+## 6. Horizontal Comparison with simdjson Deep Dive
 
-ajv 是 Node.js 生态最快的 schema 校验器，它做了大量工程优化：
-- JIT-style code-gen（把 schema 编译成 JS function）
-- V8 turbofan 内联
-- 字符串内化（V8 string deduplication）
+simdjson is the world's fastest JSON parser. Using it as a baseline is straightforward, but requires correct interpretation:
 
-**它的两大固有损失**：
+| Dimension       | IRIS                    | simdjson                  |
+|----------------|-------------------------|---------------------------|
+| Single scan count | 1 pass (fused)        | 2 passes (structural + tape) |
+| Validation      | ✅ schema + type + range | ❌ structure only        |
+| String scanning | `find_byte_pair`        | structural index bitmaps  |
+| Metadata        | Only ValidationReport   | Full tape, queryable later |
+| Memory writes   | 0                       | tape ~`len(json)/2`       |
 
-1. **JS engine overhead**：每个 char 是 UTF-16，访问 JS string 等于 V8 内部 read barrier
-2. **JSON.parse 强制构建完整 AST**：1MB JSONL 解析 → 1MB heap allocation × N
+> **Meaning of IRIS flat 0.93× simdjson**: Packed "full JSON Schema validation" into
+> the same scanning budget as simdjson.
 
-我们的对比脚本 `bench/ajv_bench.mjs` 把 `JSON.parse` 计入计时，因为
-"接受 JSON 字节串、输出 valid/invalid" 这才是工业场景。
-
-IRIS 的胜势来源：
-- C++ 没有 JIT warm-up
-- NEON / AVX2 直接 16-byte 步进
-- 零堆分配 fast path
-- LTO 跨 TU 内联
+On nested, simdjson still leads (0.55×) because simdjson uses *lazy on-demand* mode —
+`for (auto field : doc.get_object())` only triggers top-level object token parsing,
+while IRIS truly recursively validates every sub-object / every array element. If simdjson
+also "truly visits" all nested fields, the gap would return to ~1.3-1.5×.
 
 ---
 
-## 8. JIT 路径状态（asmjit）
+## 7. vs ajv: Why 5× Not 50×
+
+ajv is Node.js ecosystem's fastest schema validator with extensive engineering optimizations:
+- JIT-style code-gen (compiles schema into JS functions)
+- V8 turbofan inlining
+- String interning (V8 string deduplication)
+
+**Its two inherent losses**:
+
+1. **JS engine overhead**: Each char is UTF-16, accessing JS strings equals V8 internal read barrier
+2. **JSON.parse forces full AST construction**: 1MB JSONL parse → 1MB heap allocation × N
+
+Our comparison script `bench/ajv_bench.mjs` includes `JSON.parse` in timing, because
+"accepting JSON byte string, outputting valid/invalid" is the real industrial scenario.
+
+IRIS's winning sources:
+- C++ has no JIT warm-up
+- NEON / AVX2 direct 16-byte stride
+- Zero heap allocation fast path
+- LTO cross-TU inlining
+
+---
+
+## 8. JIT Path Status (asmjit)
 
 ```bash
 cmake -S . -B build-jit -DIRIS_ENABLE_JIT=ON
@@ -396,21 +396,21 @@ cmake --build build-jit -j
 # → [iris] ... engine=fast-jit ... 15.59 Mops/s
 ```
 
-### 当前已完成（v0.1 — 端到端管线）
+### Currently Complete (v0.1 — End-to-End Pipeline)
 
-- [x] FetchContent 拉 asmjit master
-- [x] W^X 内存：MAP_JIT + `pthread_jit_write_protect_np()`（macOS）/ 双 mprotect (Linux)
-- [x] ARM64：`mov x17, #addr; br x17` trampoline
-- [x] x86_64：`mov rax, imm64; jmp rax` trampoline
-- [x] Validator 自动 routing：`engine=fast-jit` 在日志可见
-- [x] 实测吞吐与 interpreter ±2% 内（trampoline 仅多一次间接跳）
+- [x] FetchContent pulls asmjit master
+- [x] W^X memory: MAP_JIT + `pthread_jit_write_protect_np()` (macOS) / dual mprotect (Linux)
+- [x] ARM64: `mov x17, #addr; br x17` trampoline
+- [x] x86_64: `mov rax, imm64; jmp rax` trampoline
+- [x] Validator auto routing: `engine=fast-jit` visible in logs
+- [x] Measured throughput within ±2% of interpreter (trampoline only adds one indirect jump)
 
-### 下一阶段（v0.2 — schema-specialized codegen）
+### Next Phase (v0.2 — Schema-Specialized Codegen)
 
-把 trampoline 替换为真正按 schema 烧入立即数的机器码：
+Replace trampoline with real machine code that embeds schema immediates:
 
-```
-; pseudo-ARM64，针对 4 字段 person schema 烧死
+```asm
+; pseudo-ARM64, specialized for 4-field person schema
 load    x4, [data, pos]            ; key first 8 bytes
 mov     x5, #0x656d616e             ; "name" packed
 cmp     x4, x5
@@ -419,14 +419,14 @@ mov     x5, #0x00656761             ; "age" packed
 ...
 ```
 
-预期：消除 SoA 数组的间接读，~+15% 吞吐。
+Expected: eliminate SoA array indirect reads, ~+15% throughput.
 
 ---
 
-## 9. Bowtie 兼容性
+## 9. Bowtie Compatibility
 
-[Bowtie](https://bowtie.report/) 是 JSON Schema 官方的多实现对比平台。所有
-"严肃" implementation 都必须接入它的 JSON-RPC harness：
+[Bowtie](https://bowtie.report/) is the official JSON Schema multi-implementation comparison platform. All
+"serious" implementations must integrate with its JSON-RPC harness:
 
 ```
 stdin                                stdout
@@ -437,7 +437,7 @@ stdin                                stdout
 {"cmd":"stop"}                       {}
 ```
 
-IRIS 的 driver `bench/bowtie_iris.cpp` 已经实现这条协议：
+IRIS's driver `bench/bowtie_iris.cpp` already implements this protocol:
 
 ```bash
 $ printf '%s\n' \
@@ -452,192 +452,191 @@ $ printf '%s\n' \
 {}
 ```
 
-下一步是把这个二进制打包成 OCI image 提交 [bowtie-json-schema/implementations](https://github.com/bowtie-json-schema/bowtie)。Driver 已经能正确响应所有四种命令。
+Next step is to package this binary as an OCI image and submit to [bowtie-json-schema/implementations](https://github.com/bowtie-json-schema/bowtie). Driver already correctly responds to all four command types.
 
-### Bowtie 覆盖范围（当前）
+### Bowtie Coverage (Current)
 
-- ✅ `type`（单类型 / 类型数组）
-- ✅ `properties`、`required`、`additionalProperties`
-- ✅ `minLength` / `maxLength`、`minimum` / `maximum`（integer）
-- ✅ 嵌套 `properties.x.properties.y`
-- ✅ `items`（数组，单 schema）
-- ❌ `$ref`、`allOf` / `anyOf` / `oneOf`、`pattern`（被 Inspector 投否决，slow path 待补）
-- ❌ `format`、`unevaluatedProperties`
+- ✅ `type` (single type / type array)
+- ✅ `properties`, `required`, `additionalProperties`
+- ✅ `minLength` / `maxLength`, `minimum` / `maximum` (integer)
+- ✅ Nested `properties.x.properties.y`
+- ✅ `items` (array, single schema)
+- ❌ `$ref`, `allOf` / `anyOf` / `oneOf`, `pattern` (rejected by Inspector, slow path pending)
+- ❌ `format`, `unevaluatedProperties`
 
-未支持的关键字会让 schema 编译失败，driver 上报 `{"skipped":true,...}`，符合 Bowtie 规范。
+Unsupported keywords cause schema compilation failure; driver reports `{"skipped":true,...}`, compliant with Bowtie spec.
 
 ---
 
-## 9.5 JSON Schema Test Suite 合规率
+## 9.5 JSON Schema Test Suite Compliance Rate
 
-为了诚实评估 IRIS 在官方测试集上的真实表现，我们把
+To honestly evaluate IRIS's real performance on the official test suite, we ran all 1295 cases from
 [json-schema-org/JSON-Schema-Test-Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite)
-的 `draft2020-12` 全部 1295 条 case 灌进 `bench/conformance.cpp` 跑了一遍：
+`draft2020-12` through `bench/conformance.cpp`:
 
-| 维度 | 数值 | 含义 |
+| Dimension | Value | Meaning |
 |------|------|------|
-| **总用例** | **1295** | 不含 optional 子目录 |
-| **Pass** | **179** | 完全答对 |
-| **Fail** | **6** | 答错，全部是已知架构限制 |
-| **Skipped** | **1110** | schema 含 unsupported keyword（编译期拒绝） |
-| **Raw pass rate** | **13.82 %** | 严格视角，skipped 等同失败 |
-| **Attempted pass rate** | **96.76 %** | **关键指标**：我们答了的题里有多少答对 |
-| **Skipped 占比** | **85.71 %** | 不在 Fast Path 表达力之内 |
+| **Total cases** | **1295** | Excluding optional subdirectories |
+| **Pass** | **179** | Fully correct |
+| **Fail** | **6** | Incorrect, all known architectural limitations |
+| **Skipped** | **1110** | Schema contains unsupported keywords (rejected at compile time) |
+| **Raw pass rate** | **13.82 %** | Strict view, skipped treated as failure |
+| **Attempted pass rate** | **96.76 %** | **Key metric**: Of questions we answered, how many were correct |
+| **Skipped ratio** | **85.71 %** | Beyond Fast Path expressiveness |
 
-### 分类完成度（高亮已 Fast Path 全覆盖的类别）
+### Category Completion (Highlighted categories fully covered by Fast Path)
 
-| 类别 | total | pass | fail | skipped | 备注 |
+| Category | total | pass | fail | skipped | Notes |
 |------|------:|-----:|-----:|--------:|------|
 | `type.json`         | 80  | **80** | 0 | 0  | ✅ 100 % |
 | `boolean_schema.json` | 18  | **18** | 0 | 0  | ✅ true / false / `{}` |
-| `minimum.json`      | 11  | **11** | 0 | 0  | ✅ 含浮点边界 |
-| `maximum.json`      | 8   | **8**  | 0 | 0  | ✅ 含浮点边界 |
+| `minimum.json`      | 11  | **11** | 0 | 0  | ✅ Including float boundaries |
+| `maximum.json`      | 8   | **8**  | 0 | 0  | ✅ Including float boundaries |
 | `default.json`      | 7   | **7**  | 0 | 0  | ✅ |
-| `required.json`     | 18  | 17 | 1 | 0  | 仅 escape 字符 key 失败 |
-| `properties.json`   | 28  | 15 | 1 | 12 | ghost slot 推 vacuous 通过 |
+| `required.json`     | 18  | 17 | 1 | 0  | Only escaped char key fails |
+| `properties.json`   | 28  | 15 | 1 | 12 | Ghost slot pushes vacuous pass |
 | `items.json`        | 29  | 6  | 2 | 21 | array-of-array Phase 5 |
-| `minLength` / `maxLength` | 14 | 12 | 2 | 0 | unicode grapheme 不识别 |
-| `additionalProperties.json` | 21 | 1 | 0 | 20 | bool 支持，schema 形态 skip |
+| `minLength` / `maxLength` | 14 | 12 | 2 | 0 | Unicode grapheme not recognized |
+| `additionalProperties.json` | 21 | 1 | 0 | 20 | Bool supported, schema form skipped |
 | `format` / `pattern` / `enum` / `const` / `multipleOf` | 271 | 0 | 0 | 271 | Phase 4+ |
-| `$ref` 系 / `allOf` 系 | 268 | 2 | 0 | 266 | slow path roadmap |
-| `unevaluatedProperties` / `unevaluatedItems` | 196 | 0 | 0 | 196 | 需 annotation tracking，跳 slow path |
+| `$ref` family / `allOf` family | 268 | 2 | 0 | 266 | Slow path roadmap |
+| `unevaluatedProperties` / `unevaluatedItems` | 196 | 0 | 0 | 196 | Needs annotation tracking, jump to slow path |
 
-### 剩余 6 个失败，全部是有意识的架构限制
+### Remaining 6 Failures, All Conscious Architectural Limitations
 
 ```
-items.json :: nested items :: nested array with invalid type    # array-of-array 暂走 skip_balanced
-items.json :: nested items :: not deep enough                    # 同上
-properties.json :: properties with escaped characters            # JSON escape 在 hot path 反解未实现
-required.json   :: required with escaped characters              # 同上
-minLength.json  :: one grapheme is not long enough               # 按 byte 不按 codepoint
-maxLength.json  :: two graphemes is long enough                  # 同上
+items.json :: nested items :: nested array with invalid type    # array-of-array temp uses skip_balanced
+items.json :: nested items :: not deep enough                    # same
+properties.json :: properties with escaped characters            # JSON escape in hot path unescaping not implemented
+required.json   :: required with escaped characters              # same
+minLength.json  :: one grapheme is not long enough               # By byte not codepoint
+maxLength.json  :: two graphemes is long enough                  # same
 ```
 
-### 数字怎么读
+### Reading the Numbers
 
-- **96.76 % 的 attempted 准确率** 说明：只要 schema 落在 IRIS 的 Fast Path 表达力之内，校验结果几乎总是和官方答案一致。
-- **85.71 % 的 skipped** 说明：JSON Schema 是个**远超 type+properties+required** 的语言。`$ref` / `allOf` / `oneOf` / `format` / `enum` / `const` / `multipleOf` / `pattern` / `unevaluatedProperties` 共占了规范的相当大部分，IRIS 当前明确把它们**编译期拒绝** → 在生产中应由 ajv / slow path fallback 兜底。
-- **没有"假阳性"**：IRIS 不会对自己不支持的关键字静默通过。`additionalProperties:{schema}`、`items:[tuple]`、`items:bool` 这类形态我们也主动 throw → 标 skipped，而不是冒充已支持。
+- **96.76 % attempted accuracy** means: As long as schema falls within IRIS's Fast Path expressiveness, validation results almost always match official answers.
+- **85.71 % skipped** means: JSON Schema is a language **far beyond type+properties+required**. `$ref` / `allOf` / `oneOf` / `format` / `enum` / `const` / `multipleOf` / `pattern` / `unevaluatedProperties` together occupy a considerable portion of the spec. IRIS currently explicitly **rejects them at compile time** → should be handled by ajv / slow path fallback in production.
+- **No "false positives"**: IRIS does not silently pass unsupported keywords. Forms like `additionalProperties:{schema}`, `items:[tuple]`, `items:bool` are also actively thrown → marked skipped, not pretending support.
 
-### 关键修复（这一轮新增）
+### Key Fixes (This Round's Additions)
 
-为了把数字从最初的 0.39 % 推到现在的 96.76 % attempted，我们做了 5 个改动：
+To push numbers from initial 0.39 % to current 96.76 % attempted, we made 5 changes:
 
-1. **`SchemaKind` 四态根分发**：`kAlwaysValid` / `kAlwaysInvalid` / `kObjectRoot` / `kValueRoot`。  
-   覆盖 `true` / `false` / `{}` / `{type:integer}` / `{type:["array","object"]}` 等非对象 root。
-2. **`properties` / `required` 在非对象上 vacuous**：当且仅当 `type==object` 严格匹配时才走严格 object 路径；否则走 kValueRoot，对非匹配类型直接通过。
-3. **Ghost slots**：`required:["a"]` 列出但 `properties` 没声明的字段，编译期合成 `allowed=0xFF` 的虚拟槽位，required mask 仍然生效。
-4. **浮点边界 `min_dbl`/`max_dbl`**：原来只查 `int_value`，`{"maximum":3}` 对 `3.5` 就漏判。新增并行的 double 边界，整数路径也走 double 比较。
-5. **`-ffast-math` 与 `numeric_limits::infinity()` 不兼容**：fast-math 隐含 `-ffinite-math-only`，`infinity()` 被折成 0。换成 `±DBL_MAX`，等价 finite 表达。
+1. **`SchemaKind` four-state root dispatch**: `kAlwaysValid` / `kAlwaysInvalid` / `kObjectRoot` / `kValueRoot`.  
+   Covers `true` / `false` / `{}` / `{type:integer}` / `{type:["array","object"]}` etc non-object roots.
+2. **`properties` / `required` vacuous on non-objects**: Only when `type==object` strict match do we take strict object path; otherwise take kValueRoot, directly pass non-matching types.
+3. **Ghost slots**: Fields listed in `required:["a"]` but not declared in `properties` get compile-time synthetic virtual slots with `allowed=0xFF`; required mask still effective.
+4. **Float boundaries `min_dbl`/`max_dbl`**: Originally only checked `int_value`, `{"maximum":3}` would miss-judge `3.5`. Added parallel double boundaries; integer path also uses double comparison.
+5. **`-ffast-math` incompatible with `numeric_limits::infinity()`**: fast-math implies `-ffinite-math-only`, `infinity()` folds to 0. Switched to `±DBL_MAX`, equivalent finite expression.
 
-修第 5 个 bug 之前测试就跪过一轮（max_dbl 全部为 0，导致 `{"minimum":0}` 校验 `1` 也失败）。这是个**只有跑真实测试集才能暴露的隐藏崩溃**，前面的合成 corpus 测不出来。
+Before fixing bug #5, tests failed one round (max_dbl all 0, causing `{"minimum":0}` validation of `1` to also fail). This is a **hidden crash only exposed by real test suite**; synthetic corpus couldn't detect it.
 
-### 复现
+### Reproduction
 
 ```bash
 git clone --depth 1 https://github.com/json-schema-org/JSON-Schema-Test-Suite.git .test-suite
 cmake --build build -j --target conformance
 ./build/bench/conformance .test-suite/tests/draft2020-12
-./build/bench/conformance .test-suite/tests/draft2020-12 --verbose   # 逐条失败
+./build/bench/conformance .test-suite/tests/draft2020-12 --verbose   # Per-case failure details
 ```
 
-### 与"Bowtie 完整合规"的距离
+### Distance to "Full Bowtie Compliance"
 
-Bowtie 报告里 ajv 的 raw pass rate 约 99.5 %。IRIS 现版本 raw 90.89 %，差距来自 116
-个"既 Fast 又 Slow 都没接住"的 case，分布如下：
+In Bowtie reports, ajv's raw pass rate is ~99.5 %. IRIS current version raw 90.89 %, gap comes from 116
+"neither Fast nor Slow Path caught" cases, distributed as follows:
 
-| 仍 skip 的文件 | skip 数 | 原因 |
+| Still skipped file | skip count | Reason |
 |---------------|:-------:|------|
-| `refRemote.json` | 31 | 跨文档 `$ref` (HTTP fetcher 未实现) |
-| `ref.json` | 32 | 复杂 `$id` 基 URI 重锚定、跨子 schema scope |
-| `dynamicRef.json` | 36 | 真正的 dynamic 绑定（recursive override via `$dynamicAnchor`）|
-| `anchor.json` | 6 | 嵌入式 `$id` + `$anchor` 复合 |
-| `pattern.json` / `patternProperties.json` | 5 | RE2 不支持 `\p{Letter}` 长名 (仅短名 `\p{L}` ok) |
-| `defs.json` | 2 | 元数据合规边角 |
-| 其他 | 4 | `unevaluated*` 跨 schema scope 的 annotation 合并 |
+| `refRemote.json` | 31 | Cross-document `$ref` (HTTP fetcher not implemented) |
+| `ref.json` | 32 | Complex `$id` base URI re-anchoring, cross sub-schema scope |
+| `dynamicRef.json` | 36 | True dynamic binding (recursive override via `$dynamicAnchor`)|
+| `anchor.json` | 6 | Embedded `$id` + `$anchor` composition |
+| `pattern.json` / `patternProperties.json` | 5 | RE2 doesn't support `\p{Letter}` long names (only short `\p{L}` ok) |
+| `defs.json` | 2 | Metadata compliance corners |
+| Others | 4 | `unevaluated*` cross-schema scope annotation merging |
 
-补齐这 116 个的工程量约等于：(a) 实现一个**完整 URI / 文件加载器** + 多文档 ref graph；
-(b) 实现 `$dynamicAnchor` 的 *recursive* scope-resolution（与简单 `$ref` 相比，需
-要追踪 evaluation stack 的 outermost anchor binding）。两者都是 *几乎不影响 hot
-path、只在 Slow Path 上跑* 的工作量。
+Filling these 116 requires engineering roughly equivalent to: (a) implementing a **complete URI / file loader** + multi-document ref graph;
+(b) implementing `$dynamicAnchor`'s *recursive* scope-resolution (compared to simple `$ref`, needs tracking evaluation stack's outermost anchor binding). Both are work that *almost never affects hot path, only runs on Slow Path*.
 
-attempted pass rate 已经 **99.83%**——表示一旦 IRIS 决定回答，准确率与一线 validator 同档。
+Attempted pass rate already **99.83%** — meaning once IRIS decides to answer, accuracy matches front-line validators.
 
 ---
 
-## 10. 与白皮书目标的距离
+## 10. Distance from Whitepaper Goals
 
-| 白皮书指标                           | 现状                              | 距离/差距 |
-|------------------------------------|----------------------------------|----------|
-| Fast Path 吞吐 > simdjson 解析 5×    | **0.69× simdjson (flat)**         | 物理极限以外的目标，需 AMX/SVE 才能突破 |
-| 比 ajv 快 ≥ 5×                       | **× 4.5 (flat) / × 5.0 (nested)** | ✅ 已达成 |
-| Bowtie 接入                          | **已接入，draft-2020-12 子集**     | 需把 OCI image 推到 bowtie-json-schema |
-| AOT 完美哈希构造率 > 99%             | **mixed FNV-1a + fmix64 > 99.5%** | ✅ |
-| JIT 生效                             | **asmjit::Compiler API 已切换**    | 见 §11 |
-| 嵌套 schema 完整校验                  | **递归 properties/items 已支持**   | ✅ |
-| **JSON Schema Test Suite raw**       | **90.89%** (was 13.82%)           | 距 99% 还有跨文档 ref 等长尾 |
-| **JSON Schema Test Suite attempted** | **99.83%**                        | ✅ |
+| Whitepaper Indicator                  | Current Status                            | Gap/Distance |
+|--------------------------------------|------------------------------------------|----------|
+| Fast Path throughput > simdjson parse 5×    | **0.69× simdjson (flat)**                 | Target beyond physical limits, requires AMX/SVE to break through |
+| ≥ 5× faster than ajv                       | **× 4.5 (flat) / × 5.0 (nested)**         | ✅ Achieved |
+| Bowtie integration                          | **Integrated, draft-2020-12 subset**       | Need to push OCI image to bowtie-json-schema |
+| AOT perfect hash construction rate > 99%    | **mixed FNV-1a + fmix64 > 99.5%**         | ✅ |
+| JIT effective                               | **asmjit::Compiler API switched**          | See §11 |
+| Nested schema full validation                | **Recursive properties/items supported**   | ✅ |
+| **JSON Schema Test Suite raw**               | **90.89%** (was 13.82%)                   | Distance to 99% still has cross-document ref etc long tail |
+| **JSON Schema Test Suite attempted**         | **99.83%**                                | ✅ |
 
 ---
 
-## 11. JIT 路径：asmjit::Compiler API
+## 11. JIT Path: asmjit::Compiler API
 
-JIT 现状是**双轨**：
+JIT current status is **dual-track**:
 
-### 11.1 Trampoline 轨（生产路径）— `BaseAssembler`
+### 11.1 Trampoline Track (Production Path) — `BaseAssembler`
 
-Validator 实际使用的 JIT 函数仍由 `asmjit::Assembler` 手工 emit：
+Validator's actual JIT function still hand-emitted by `asmjit::Assembler`:
 
 ```
 ARM64:    mov x17, #&interpreter ; br x17     (8 bytes)
 x86_64:   mov rax, #&interpreter ; jmp rax    (12 bytes)
 ```
 
-**为什么继续用 Assembler？** JitValidatorFn 返回 `ValidationReport`（24 bytes），
-ARM64 ABI 通过隐式 `x8` 寄存器传 sret 指针。asmjit::Compiler 的虚拟寄存器分配器
-当前没把"caller-managed sret 寄存器"纳入它的虚拟空间，所以**最短路径的 tail-jmp
-继续手写 ABI** 性能最优；上层 Compiler API 反而会强制 prolog/epilog。
+**Why continue using Assembler?** JitValidatorFn returns `ValidationReport` (24 bytes),
+ARM64 ABI passes sret pointer via implicit `x8` register. asmjit::Compiler's virtual register
+allocator currently doesn't incorporate "caller-managed sret register" into its virtual space,
+so **shortest path tail-jmp continues hand-written ABI** for optimal performance; upper Compiler
+API would force prolog/epilog overhead.
 
-### 11.2 Compiler API 轨（演示 + 脚手架）— `BaseCompiler`
+### 11.2 Compiler API Track (Demo + Scaffolding) — `BaseCompiler`
 
-新加 `jit_compile_compiler_demo()` 走完整 Compiler API 管线：
+Added `jit_compile_compiler_demo()` walks complete Compiler API pipeline:
 
-1. `FuncSignature::build<uint64_t, uint64_t>()` 声明签名
-2. `cc.add_func(sig)` 创建函数节点
-3. `func->set_arg(0, seed)` 把入参映射到虚拟寄存器
-4. 分配 **32 个虚拟 GP 寄存器**（ARM64 物理可用 ≤ 29，x86_64 ≤ 14）
-5. 链式 `ROR + ADD imm` 强制所有 vreg 在 ret 前活跃
+1. `FuncSignature::build<uint64_t, uint64_t>()` declares signature
+2. `cc.add_func(sig)` creates function node
+3. `func->set_arg(0, seed)` maps input arg to virtual register
+4. Allocate **32 virtual GP registers** (ARM64 physical available ≤ 29, x86_64 ≤ 14)
+5. Chain `ROR + ADD imm` forcing all vregs live before ret
 6. `cc.ret(acc); cc.end_func(); cc.finalize()`
 
-asmjit 的 **RAPass** 自动：
-- 给前 K 个 vreg 分配物理寄存器
-- 当物理寄存器爆掉时为溢出 vreg 分配栈帧槽位
-- 在每次使用点 emit `ldr/str` (ARM) / `mov [rbp+off], reg` (x86)
-- 完成 callee-saved 寄存器的 save/restore（你能在 disasm 里看到 `stp x19, x20, [sp,-96]!` 这种 prolog）
+asmjit's **RAPass** automatically:
+- Assigns physical registers to first K vregs
+- Allocates stack frame slots when physical registers exhausted for spilled vregs
+- Emits `ldr/str` (ARM) / `mov [rbp+off], reg` (x86) at each use point
+- Completes callee-saved register save/restore (you can see `stp x19, x20, [sp,-96]!` style prolog in disasm)
 
-单元测试 `jit_compiler_api_demo_spill_works` 验证生成的函数能跑通且确定性。
+Unit test `jit_compiler_api_demo_spill_works` verifies generated function runs and is deterministic.
 
-### 11.3 寄存器爆满如何回退？
+### 11.3 What Happens When Registers Run Out?
 
-直接的答复：**asmjit::Compiler 不需要回退到解释器**。
+Direct answer: **asmjit::Compiler needs no fallback to interpreter**.
 
-当 schema-specialized codegen 引用的虚拟寄存器超过物理寄存器数量时，RAPass
-按 liveness analysis 安排栈帧 spill slot，每个用点重新 `ldr/str` 加载。
-这只是多几条 spill/reload 指令，并不会让 JIT 编译失败。Validator 看不到差别——
-它只看 `JitValidatorFn != nullptr`。
+When schema-specialized codegen references more virtual registers than physical register count, RAPass
+arranges stack frame spill slots per liveness analysis, reloading with `ldr/str` at each use point.
+This just adds a few spill/reload instructions, won't cause JIT compilation failure. Validator sees
+no difference — it only sees `JitValidatorFn != nullptr`.
 
-唯一会让 JIT 失败回退到 Fast Path 解释器的情况是：
-- `mmap` 不到 W^X 内存（Apple JIT entitlement 缺失 / SELinux 拒绝）
-- asmjit `finalize()` 报错（罕见，通常是程序员构造了非法立即数编码）
+The only situations causing JIT failure fallback to Fast Path interpreter:
+- Failed to `mmap` W^X memory (missing Apple JIT entitlement / SELinux rejection)
+- asmjit `finalize()` error (rare, usually programmer constructed illegal immediate encoding)
 
-这两种情况 `jit_compile()` 返回 `nullptr`，Validator 把 `path_` 留在
-`kFastInterpret`，端到端继续工作。
+These two cases `jit_compile()` returns `nullptr`, Validator leaves `path_` at
+`kFastInterpret`, end-to-end continues working.
 
 ---
 
-## 12. 慢车道（Slow Path）—— 真实现
+## 12. Slow Path (Slow Path) — Real Implementation
 
-### 12.1 架构
+### 12.1 Architecture
 
 ```
                   ┌──────────────────────────┐
@@ -663,102 +662,102 @@ asmjit 的 **RAPass** 自动：
                          ValidationError::kNotImplemented
 ```
 
-### 12.2 关键字覆盖
+### 12.2 Keyword Coverage
 
-| 类别 | keyword | 状态 |
+| Category | keyword | Status |
 |------|--------|------|
 | Type assertion | type, const, enum | ✅ |
 | Numeric | minimum, maximum, exclusive*, multipleOf | ✅ (with IEEE-754 finite check) |
 | String | minLength, maxLength, pattern, format | ✅ (annotation-only format per spec) |
 | Array | items, prefixItems, contains, min/maxItems, uniqueItems | ✅ |
-| Array (clustered) | additionalItems, min/maxContains, unevaluatedItems | ✅ (协同求值 + annotation tracking) |
+| Array (clustered) | additionalItems, min/maxContains, unevaluatedItems | ✅ (cooperative eval + annotation tracking) |
 | Object | properties, required, propertyNames, min/maxProperties | ✅ |
-| Object (clustered) | patternProperties, additionalProperties, unevaluatedProperties | ✅ (协同求值 + annotation tracking) |
+| Object (clustered) | patternProperties, additionalProperties, unevaluatedProperties | ✅ (cooperative eval + annotation tracking) |
 | Dependencies | dependentRequired, dependentSchemas | ✅ |
-| Composition | allOf, anyOf, oneOf, not, if-then-else | ✅ (短路求值 + annotation 合并规则) |
-| References | $ref, $defs, $anchor, $dynamicRef→$ref, $dynamicAnchor | ✅ same-document; 跨文档/真正 dynamic binding deferred |
+| Composition | allOf, anyOf, oneOf, not, if-then-else | ✅ (short-circuit eval + annotation merge rules) |
+| References | $ref, $defs, $anchor, $dynamicRef→$ref, $dynamicAnchor | ✅ same-document; cross-document/true dynamic binding deferred |
 
-### 12.3 数据共享（Fast ↔ Slow 之间）
+### 12.3 Data Sharing (Fast ↔ Slow Between)
 
-- **schema 端**：Fast Path 与 Slow Path 各持有独立的编译产物（CompiledSchema 是 SoA / SlowSchema 是 AST）。两者一次性按 ValidatorBuild 中的 fallback 顺序产出，schema 内存不重叠。这是空间换时间——但 schema 通常 < 10KB，不是瓶颈。
-- **instance 端**：Fast Path **零拷贝** 直接 SIMD 扫原始字节；Slow Path 必须做一次
-  JsonReader → JsonValue 树解析（因为它需要 tree-shape 访问做 const/enum 深度比较）。
-  原始字节流仍是 `string_view`，没有任何二次复制。
+- **Schema side**: Fast Path and Slow Path each hold independent compilation products (CompiledSchema is SoA / SlowSchema is AST). Both are produced once in ValidatorBuild's fallback order; schema memory doesn't overlap. This is space-for-time tradeoff — but schema typically < 10KB, not a bottleneck.
+- **Instance side**: Fast Path **zero-copy** directly SIMD scans raw bytes; Slow Path must do one
+  JsonReader → JsonValue tree parse (because it needs tree-shape access for const/enum deep comparison).
+  Raw byte stream remains `string_view`, no secondary copying.
 
-### 12.4 正则：RE2 优先 / std::regex 回退
+### 12.4 Regex: RE2 Priority / std::regex Fallback
 
-`CMakeLists.txt` 用 `find_package(re2 QUIET)` 探测系统 RE2：
+`CMakeLists.txt` uses `find_package(re2 QUIET)` to detect system RE2:
 
-| 路径 | 时间复杂度 | ReDoS 安全 | 备注 |
+| Path | Time Complexity | ReDoS Safe | Notes |
 |------|----------|-----------|------|
-| **RE2 后端** (推荐) | 线性 O(n+m) | ✅ | `brew install re2` / `apt install libre2-dev` |
-| std::regex 回退 | 最坏 O(2^n) | ❌ | 仅供没装 RE2 的开发机使用 |
+| **RE2 backend** (recommended) | Linear O(n+m) | ✅ | `brew install re2` / `apt install libre2-dev` |
+| std::regex fallback | Worst O(2^n) | ❌ | Only for dev machines without RE2 |
 
-`CompiledRegex` 是 opaque pimpl 包装，hot path 上只看 `partial_match()` 接口；
-后端切换完全透明。pattern 在 `compile_slow_schema` 阶段就编译好放入 `regex_cache`，
-hot path 只做 ptr 查表。
+`CompiledRegex` is opaque pimpl wrapper; hot path only sees `partial_match()` interface;
+backend switching completely transparent. Pattern compiled at `compile_slow_schema` stage into `regex_cache`;
+hot path only does ptr lookup.
 
-### 12.5 实测吞吐
+### 12.5 Measured Throughput
 
-100K 条记录 × 3 iters：
+100K records × 3 iters:
 
 | schema | Fast Mops/s | Slow Mops/s | Slow MB/s | Slow ÷ Fast |
 |--------|:----------:|:----------:|:---------:|:-----------:|
 | flat   | 11.21      | **1.17**   | 67.3      | 10.4%       |
 | nested | 5.76       | **0.55**   | 56.4      | 9.5%        |
 
-Slow Path 的 ~10x 慢主要来自：
-- JsonReader 解析（malloc 节点、build JsonValue 树）
-- 递归 keyword 解释器调用开销
-- `json_eq` 在 const/enum 上做深度比较
+Slow Path's ~10x slowdown mainly from:
+- JsonReader parsing (malloc nodes, build JsonValue tree)
+- Recursive keyword interpreter call overhead
+- `json_eq` deep comparison on const/enum
 
-但 Slow Path 仍达到 **ajv 速度的 48%**——这是 ajv 已经在 V8 Hidden Class + Inline
-Cache 上跑过的优化代码。IRIS Slow Path 在没有 JIT 的情况下接近 ajv 一半速度，是
-正常水平。
+But Slow Path still reaches **48% of ajv speed** — this is ajv already running optimized code on
+V8 Hidden Class + Inline Cache. IRIS Slow Path approaching half of ajv's speed without JIT is
+normal level.
 
 ---
 
-## 13. 复现
+## 13. Reproduction
 
-机器：x86_64 Linux（AVX2）或 Apple Silicon（NEON）皆可。
+Machine: x86_64 Linux (AVX2) or Apple Silicon (NEON) both work.
 
 ```bash
 git clone <repo> iris && cd iris
 
-# 性能对比
-./scripts/compare.sh 100000 3      # 100K 条 × 3 轮
+# Performance comparison
+./scripts/compare.sh 100000 3      # 100K records × 3 rounds
 
-# 合规率
+# Compliance rate
 git clone https://github.com/json-schema-org/JSON-Schema-Test-Suite .test-suite
 ./build/bench/conformance .test-suite/tests/draft2020-12
 
-# 慢车道吞吐
+# Slow path throughput
 ./build/bench/iris_validate --slow bench-data/flat/schema.json bench-data/flat/data.jsonl 3
 ```
 
-CI 上同样的脚本跑在两个 runner（`ubuntu-24.04`、`macos-14`），见 `.github/workflows/bench.yml`。
+Same scripts run on two runners (`ubuntu-24.04`, `macos-14`) in CI, see `.github/workflows/bench.yml`.
 
 ---
 
-## 14. 路线图（下一阶段）
+## 14. Roadmap (Next Phase)
 
-1. **JIT v0.3 — schema-specialized codegen**：把 SoA 数组的间接读改为立即数烧入
-   asmjit::Compiler emit。预期 nested 提升至 10 Mops/s+。Compiler API 脚手架已就位。
-2. **Bowtie 公网部署**：打包 OCI image 提交 bowtie-json-schema 仓库。
-3. **跨文档 $ref**：URI fetcher + 文档加载器；预期 raw 合规率 +5%。
-4. **$dynamicAnchor recursive binding**：真正的动态绑定语义；预期 +3%。
-5. **SVE2 / AVX-512 支持**：当前仅 NEON 128-bit + AVX2。
-6. **慢车道局部 JIT**：对常见的 allOf({type:integer}, {minimum:N}) 等组合做
-   peephole 编译到 fast 子路径。
+1. **JIT v0.3 — schema-specialized codegen**: Replace SoA array indirect reads with immediate value embedding
+   via asmjit::Compiler emit. Expected nested boost to 10 Mops/s+. Compiler API scaffolding already in place.
+2. **Bowtie public deployment**: Package OCI image and submit to bowtie-json-schema repository.
+3. **Cross-document $ref**: URI fetcher + document loader; expected raw compliance rate +5%.
+4. **$dynamicAnchor recursive binding**: True dynamic binding semantics; expected +3%.
+5. **SVE2 / AVX-512 support**: Currently only NEON 128-bit + AVX2.
+6. **Slow path partial JIT**: Peephole compile common patterns like allOf({type:integer}, {minimum:N})
+   to fast sub-paths.
 
 ---
 
-## 15. 致谢与参考
+## 15. Acknowledgments and References
 
-- 白皮书：`IRIS (Irisoul's Resolver for Inline Schema) 架构白皮书.pdf`
-- simdjson, Lemire et al.：https://github.com/simdjson/simdjson
-- ajv, Evgeny Poberezkin：https://github.com/ajv-validator/ajv
+- Whitepaper: `IRIS (Irisoul's Resolver for Inline Schema) Architecture Whitepaper.pdf`
+- simdjson, Lemire et al.: https://github.com/simdjson/simdjson
+- ajv, Evgeny Poberezkin: https://github.com/ajv-validator/ajv
 - RE2, Russ Cox: https://github.com/google/re2
-- Bowtie：https://docs.bowtie.report
-- asmjit, Petr Kobalíček：https://asmjit.com
+- Bowtie: https://docs.bowtie.report
+- asmjit, Petr Kobalíček: https://asmjit.com
 - JSON Schema Test Suite: https://github.com/json-schema-org/JSON-Schema-Test-Suite

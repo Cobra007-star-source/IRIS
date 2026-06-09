@@ -36,3 +36,8 @@ flamegraph*.svg
 *.pem
 *.key
 id_rsa*
+
+# Chinese documentation files (internal reference only)
+*[一-龥]*.md
+*[一-龥]*.txt
+irisense*.txt

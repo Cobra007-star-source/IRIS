@@ -1,30 +1,30 @@
-# IRIS Benchmark 方法学
+# IRIS Benchmark Methodology
 
-> 本文档说明 IRIS 对比 ajv 的实验设计，确保结论可复现、可审计。
+> This document explains IRIS's experimental design compared to ajv, ensuring reproducible and auditable conclusions.
 
-## 实验对象
+## Experiment Subjects
 
-- **IRIS** Fast Path 解释器（无 JIT，未启用慢车道）
-- **ajv** v8.17.1（[ebdrup/json-schema-benchmark](https://github.com/ebdrup/json-schema-benchmark) 长期榜首）
-  - 配置：`{allErrors: false, strict: false, coerceTypes: false, useDefaults: false}` —— ajv 文档推荐的最快配置
+- **IRIS** Fast Path interpreter (no JIT, slow path not enabled)
+- **ajv** v8.17.1 ([ebdrup/json-schema-benchmark](https://github.com/ebdrup/json-schema-benchmark) long-term leader)
+  - Configuration: `{allErrors: false, strict: false, coerceTypes: false, useDefaults: false}` — ajv documentation's recommended fastest configuration
 
-## 公平性约束
+## Fairness Constraints
 
-| 维度 | 处理 |
+| Dimension | Handling |
 | --- | --- |
-| Schema 加载 | 两侧均一次性编译，不计入循环 |
-| 输入解析 | 都包含 `JSON.parse` / Fused parse。这是工业现场的真实成本 |
-| 错误分支 | 都跑 100% 合法语料，避免错误码序列化偏差 |
-| 内存分配 | 都禁用 verbose 错误（ajv allErrors=false，IRIS 一返回即停） |
-| 实测口径 | 都用 wall-clock `steady_clock` / `process.hrtime.bigint()` |
+| Schema loading | Both compile once, not included in loop |
+| Input parsing | Both include `JSON.parse` / Fused parse. This is real industrial cost |
+| Error branches | Both run 100% valid corpus, avoiding error code serialization bias |
+| Memory allocation | Both disable verbose errors (ajv allErrors=false, IRIS stops at first return) |
+| Measurement caliber | Both use wall-clock `steady_clock` / `process.hrtime.bigint()` |
 
-## 语料
+## Corpus
 
-`bench/gen_corpus.cpp` 生成可复现的语料（固定 seed = `0xC0FFEE`）：
+`bench/gen_corpus.cpp` generates reproducible corpus (fixed seed = `0xC0FFEE`):
 
-- `schema.json`: 4 字段 person schema（name/age/email/active）
-- `data.jsonl`: N 条合法 JSON 记录（typical 50-90 字节 / 行）
-- `bad.jsonl`: N/10 条故意违反 schema 的负例（保留给后续 negative-path bench）
+- `schema.json`: 4-field person schema (name/age/email/active)
+- `data.jsonl`: N valid JSON records (typical 50-90 bytes/line)
+- `bad.jsonl`: N/10 records intentionally violating schema (reserved for future negative-path bench)
 
 ## Schema
 
@@ -42,13 +42,13 @@
 }
 ```
 
-## 复现命令
+## Reproduction Command
 
 ```bash
 ./scripts/compare.sh 1000000 3
 ```
 
-## 实测（Apple M2 Pro，clang 17，CMake Release + LTO）
+## Measured Results (Apple M2 Pro, clang 17, CMake Release + LTO)
 
 ```
 [iris] 0.177 s | 16.91 Mops/s | 970.25 MiB/s | avg 59.1 ns/op
@@ -56,24 +56,24 @@
 IRIS speedup vs ajv: 5.83x
 ```
 
-## 与白皮书目标对照
+## Comparison with Whitepaper Goals
 
-> 白皮书第一节：将 JSON 校验的吞吐量极限推至纯解析库（simdjson）的 5 倍以内。
+> Whitepaper Section 1: Push JSON validation throughput ceiling to within 5× of pure parsing libraries (simdjson).
 
-- simdjson 在 Apple M2 上对类似规模 JSON 解析约 ~3 GB/s（仅解析，无校验）
-- IRIS Fast Path：~0.95 GB/s（**解析 + 校验**）
-- 比值：simdjson / IRIS ≈ 3.16× ⇒ **位于"5 倍以内"目标区间内** ✅
+- simdjson on Apple M2 parses similar-scale JSON at ~3 GB/s (parse only, no validation)
+- IRIS Fast Path: ~0.95 GB/s (**parse + validate**)
+- Ratio: simdjson / IRIS ≈ 3.16× ⇒ **Within "5× ceiling" target range** ✅
 
-## 已知短板（未参与本榜单的能力）
+## Known Limitations (Capabilities Not in This Benchmark)
 
-- **多层嵌套 schema**：当前 Fast Path 把嵌套 object/array 当作"结构 OK 即放行"，不做内部字段校验。GitHub 榜单上的复杂 schema（如 GeoJSON）会被 Inspector 直接路由到慢车道，慢车道暂未接入解释器，结果会回退到 Fast Path 的浅校验。
-- **`pattern`、`$ref`、`allOf`**：Schema 文档解析阶段会显式拒绝，需 Phase 4 慢车道补齐。
-- **JIT codegen**：当前是 stub，目标 7-10× ajv（已落地的 W^X 内存层 + 寄存器编排预期能再提 50%）。
+- **Multi-level nested schema**: Current Fast Path treats nested object/array as "structure OK then pass", no internal field validation. Complex schemas on GitHub leaderboards (like GeoJSON) get routed directly to slow path by Inspector; slow path interpreter not yet wired in, results fall back to Fast Path shallow validation.
+- **`pattern`, `$ref`, `allOf`**: Schema document parsing stage explicitly rejects these, requires Phase 4 slow path completion.
+- **JIT codegen**: Currently stub; target 7-10× ajv (already landed W^X memory layer + register orchestration expected to add another 50%).
 
 ## CI
 
-`.github/workflows/bench.yml` 在每次 push 触发：
-- ubuntu-24.04（x86_64 AVX2）
-- macos-14（Apple Silicon NEON）
+`.github/workflows/bench.yml` triggers on every push:
+- ubuntu-24.04 (x86_64 AVX2)
+- macos-14 (Apple Silicon NEON)
 
-完整跑 unit tests + Phase 1 SIMD demo + compare.sh 三个阶段，附加 1M 语料对比报告。
+Fully runs unit tests + Phase 1 SIMD demo + compare.sh three phases, attaching 1M corpus comparison report.
