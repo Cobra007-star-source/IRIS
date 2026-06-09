@@ -43,7 +43,7 @@ The image builds from a fresh clone of GitHub, so push your changes first (or
 point `IRIS_REF` at your branch): `--build-arg IRIS_REF=<branch>`.
 
 ```bash
-docker build -t cpp-iris -f bowtie/Dockerfile .   # builds from a fresh clone of IRIS@main
+docker build -t cpp-iris -f bowtie/Dockerfile .   # builds from a fresh clone of IRIS@v0.1.0
 printf '%s\n%s\n%s\n' \
   '{"cmd":"start","version":1}' \
   '{"cmd":"dialect","dialect":"https://json-schema.org/draft/2020-12/schema"}' \

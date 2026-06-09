@@ -1,0 +1,41 @@
+# =============================================================================
+# Local verification image for the Bowtie harness.
+#
+# Same Alpine/musl toolchain, apk packages and CMake flags as the submission
+# Dockerfile, but builds from the LOCAL build context (COPY .) instead of
+# cloning GitHub. Use this to verify the harness compiles under musl WITHOUT
+# needing the repo to be public or a push to have landed:
+#
+#   docker build -f bowtie/Dockerfile.local -t bowtie-iris:local .
+#
+# The only difference from bowtie/Dockerfile is source acquisition; the compile
+# path it exercises is identical.
+# =============================================================================
+FROM alpine:3.22 AS build
+
+RUN apk add --no-cache \
+        build-base \
+        cmake \
+        git \
+        re2-dev \
+        abseil-cpp-dev
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DIRIS_ENABLE_LTO=OFF \
+        -DIRIS_BUILD_SIMDJSON=OFF \
+        -DIRIS_BUILD_GATEWAY=OFF \
+        -DIRIS_BUILD_TESTS=OFF \
+        -DIRIS_BUILD_EXAMPLES=OFF \
+        -DIRIS_BUILD_BENCHMARKS=ON \
+        -DIRIS_BUILD_BOWTIE=ON \
+        -DIRIS_ENABLE_JIT=OFF \
+    && cmake --build build --target bowtie_iris
+
+FROM alpine:3.22
+RUN apk add --no-cache libstdc++ re2 abseil-cpp
+COPY --from=build /src/build/bench/bowtie_iris /usr/local/bin/bowtie_iris
+CMD ["bowtie_iris"]

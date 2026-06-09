@@ -20,8 +20,9 @@ RUN apk add --no-cache \
         abseil-cpp-dev
 
 WORKDIR /src
-# Pin to a tag/commit when cutting a release; main is fine while iterating.
-ARG IRIS_REF=main
+# Pinned to a release tag so bowtie.report results map to a fixed snapshot.
+# Override with --build-arg IRIS_REF=<branch|tag> to test other revisions.
+ARG IRIS_REF=v0.1.0
 RUN git clone --depth 1 --branch "${IRIS_REF}" \
         https://github.com/Cobra007-star-source/IRIS.git .
 
