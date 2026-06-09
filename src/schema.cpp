@@ -1,12 +1,6 @@
 // =============================================================================
-// src/schema.cpp
-//
-// FieldSpec[] -> CompiledSchema 的编译器。
-//
-// 工作内容：
-//   1. 提取所有字段名，构造完美哈希
-//   2. 把每个字段的约束按“槽位”重排为 SoA
-//   3. required 字段 OR 入位掩码
+// schema.cpp
+// Compiler from FieldSpec[] to CompiledSchema (perfect hash + SoA layout)
 // =============================================================================
 #include "iris/schema.hpp"
 
@@ -48,8 +42,8 @@ SchemaBuildResult compile_schema(std::span<const FieldSpec> fields,
     r.schema.max_string_len.assign(N, 0);
     r.schema.min_int.assign(N, INT64_MIN);
     r.schema.max_int.assign(N, INT64_MAX);
-    // -ffast-math 假定 finite-math-only，numeric_limits::infinity() 会被折成 0。
-    // 改用 ±DBL_MAX，对所有合法 JSON 数值具有等价的"无约束"语义。
+    // -ffast-math assumes finite-math-only; numeric_limits::infinity() folds to 0.
+    // Use ±DBL_MAX for equivalent "unconstrained" semantics on valid JSON numbers.
     r.schema.min_dbl.assign(N, -DBL_MAX);
     r.schema.max_dbl.assign(N,  DBL_MAX);
     r.schema.field_names.assign(N, std::string{});
@@ -69,8 +63,8 @@ SchemaBuildResult compile_schema(std::span<const FieldSpec> fields,
         r.schema.max_string_len[slot] = fields[i].max_string_len;
         r.schema.min_int[slot]        = fields[i].min_int;
         r.schema.max_int[slot]        = fields[i].max_int;
-        // 把 int 边界镜像到 double 边界，便于 fast path 在 number 路径用一套比较；
-        // INT64_MIN/MAX 映射到 ±inf 维持"无约束"语义（不要被 1<<63 的 1<<63 浮点精度误差污染）。
+        // Mirror int bounds to double so fast path uses one comparison path for numbers;
+        // INT64_MIN/MAX map to ±inf for "unconstrained"; avoid 1<<63 float precision loss.
         r.schema.min_dbl[slot] = (fields[i].min_int == std::numeric_limits<std::int64_t>::min())
                                    ? -DBL_MAX
                                    : static_cast<double>(fields[i].min_int);
@@ -83,7 +77,7 @@ SchemaBuildResult compile_schema(std::span<const FieldSpec> fields,
         }
     }
 
-    // 短键直查表：仅当所有 key 长度 ≤ 8 且字段数 ≤ kMaxKeys 时启用
+    // Short-key direct table: only when all keys len ≤ 8 and field count ≤ kMaxKeys
     bool all_short = (N <= ShortKeyTable::kMaxKeys);
     if (all_short) {
         for (auto& f : fields) {
@@ -110,7 +104,7 @@ SchemaBuildResult compile_schema(std::span<const FieldSpec> fields,
 }
 
 // =============================================================================
-// JSON Schema 文档解析器（递归，支持 properties / items 嵌套）
+// JSON Schema document parser (recursive; properties / items nesting)
 // =============================================================================
 
 namespace {
@@ -140,7 +134,7 @@ struct CompileError {
     std::string msg;
 };
 
-// 一组不被 Fast Path 支持的关键字。出现其一即编译失败，落 slow path。
+// Keywords unsupported by fast path; any one fails compile → slow path.
 constexpr std::string_view kUnsupported[] = {
     "$ref", "$dynamicRef", "$anchor", "$dynamicAnchor",
     "allOf", "anyOf", "oneOf", "not",
@@ -163,13 +157,13 @@ bool keyword_unsupported(std::string_view k) noexcept {
     return false;
 }
 
-// 递归地把一段 JSON Schema "object" 编译为 CompiledSchema。
-// 失败时抛 CompileError（仅在编译期，热路径不抛）。
+// Recursively compile a JSON Schema object into CompiledSchema.
+// Throws CompileError on failure (compile time only; hot path does not throw).
 CompiledSchema compile_root(const JsonValue& v);
 CompiledSchema compile_object_schema(const JsonValue& v);
 
-// 通用 schema → "单值约束" 的提取（仅 type + 简单标量约束）。
-// 失败抛 CompileError。
+// Extract single-value constraints (type + simple scalars) from generic schema.
+// Throws CompileError on failure.
 struct ValueConstraintBuild {
     TypeMask                        allowed         = kTypeNone;
     std::uint32_t                   min_string_len  = 0;
@@ -197,24 +191,24 @@ ValueConstraintBuild compile_value_schema(const JsonValue& v) {
         else if (k == "minimum"   && x.is_number()) { r.min_int = x.as_int(); r.min_dbl = x.as_double(); }
         else if (k == "maximum"   && x.is_number()) { r.max_int = x.as_int(); r.max_dbl = x.as_double(); }
         else if (k == "properties" || k == "required" || k == "additionalProperties") {
-            // 由 compile_object_schema 处理；不在这里再校验
+            // handled by compile_object_schema; skip here
         }
         else if (keyword_unsupported(k)) {
             throw CompileError{"unsupported keyword: " + std::string(k)};
         }
-        // 其余允许的杂项关键字（如 description / $schema / $id / examples / default 等）忽略
+        // ignore other allowed metadata (description / $schema / $id / examples / default)
     }
     r.allowed = extract_type(type_v);
     if (r.allowed == kTypeNone) {
-        // 没声明 type：理论上代表"任意类型"。Fast Path 用全 1 mask 表达"任意"。
+        // no type: any type; fast path uses all-ones mask for "any".
         r.allowed = 0xFFu;
     }
 
     if (r.allowed & kTypeObject) {
-        // 任何会约束 object 形态的关键字都触发 obj_nested 构造：
-        //   - properties（字段类型/约束）
-        //   - additionalProperties:false（拒绝未知字段）
-        //   - required（强制字段存在；ghost slot 处理）
+        // any keyword constraining object shape triggers obj_nested:
+        //   - properties (field types/constraints)
+        //   - additionalProperties:false (reject unknown fields)
+        //   - required (mandatory fields; ghost slots)
         const JsonValue* props_v = nullptr;
         const JsonValue* addp_v  = nullptr;
         const JsonValue* req_v   = nullptr;
@@ -232,26 +226,26 @@ ValueConstraintBuild compile_value_schema(const JsonValue& v) {
     if (r.allowed & kTypeArray) {
         if (items_v) {
             if (!items_v->is_object()) {
-                // items: true / false / array of schemas - 暂归 slow path
+                // items: true / false / array of schemas → slow path for now
                 throw CompileError{"items must be a single object schema in fast path"};
             }
-            // 拒绝多层嵌套数组（array of array of ...）—— Fast Path 的 CompiledSchema
-            // 只为 item 携带 object-nested 槽位，没法表达再一层数组约束；这种 schema
-            // 让它跌到 slow path，慢车道递归求值天然支持任意深度。
+            // reject nested arrays — fast path CompiledSchema
+            // only carries object-nested item slot; cannot express another array level;
+            // fall through to slow path, which supports arbitrary depth.
             for (auto& [ik, iv] : items_v->as_object()) {
                 if (ik == "items" || ik == "prefixItems")
                     throw CompileError{"nested array items not supported in fast path"};
             }
             auto inner = compile_value_schema(*items_v);
             r.item_type = inner.allowed;
-            // 若 item 是 object，把它的 obj_nested 转移过来
+            // if item is object, transfer its obj_nested
             r.item_nested = std::move(inner.obj_nested);
         }
     }
     return r;
 }
 
-// 旧 API：保留以便 compile_object_schema 内部继续用
+// Legacy API kept for compile_object_schema internals
 struct ItemBuild {
     TypeMask                        item_type = kTypeNone;
     std::unique_ptr<CompiledSchema> item_nested;
@@ -287,14 +281,14 @@ CompiledSchema compile_object_schema(const JsonValue& v) {
         additional_props = addp_v->as_bool();
     }
 
-    // 收集所有字段名：properties 内的，加上 required 列出但 properties 没声明的（ghost slot）
+    // Collect field names from properties plus required-only ghost slots
     std::vector<std::string> name_buf;
     std::vector<ValueConstraintBuild> vc_buf;
     std::vector<const JsonValue*> sub_buf;
 
-    // 检查字段名中是否含需要 JSON 转义的字符。Fast Path 的 perfect hash 直接
-    // hash 原始字节（含转义反斜杠），所以包含 \n / \" / \\ 等的字段名匹配会
-    // 失败。出现这种 key 立刻拒绝，让 schema 落入 slow path。
+    // Reject keys needing JSON escape. Fast path perfect hash hashes raw bytes
+    // (including escape backslashes), so \n / \" / \\ in names would mismatch;
+    // reject immediately so schema uses slow path.
     auto needs_escape = [](std::string_view s)->bool {
         for (unsigned char c : s) {
             if (c < 0x20 || c == '"' || c == '\\') return true;
@@ -312,7 +306,7 @@ CompiledSchema compile_object_schema(const JsonValue& v) {
             sub_buf.push_back(&sub);
         }
     }
-    // ghost slots：required 中但不在 properties 的字段
+    // ghost slots: required but not in properties
     if (req_v && req_v->is_array()) {
         for (auto& rv : req_v->as_array()) {
             if (!rv.is_string()) continue;
@@ -357,9 +351,9 @@ CompiledSchema compile_object_schema(const JsonValue& v) {
         cs.field_names[slot] = name_buf[i];
 
         if (vc_buf[i].allowed & kTypeObject) {
-            // ghost slot 没有原始 JsonValue 节点；只对真实声明的属性递归
+            // ghost slot has no JsonValue node; recurse only declared properties
             if (sub_buf[i]) {
-                // 直接搬运 vc 已经编译好的 obj_nested 即可
+                // reuse vc's already-compiled obj_nested
                 cs.nested_object[slot] = std::move(vc_buf[i].obj_nested);
             }
         }
@@ -371,12 +365,12 @@ CompiledSchema compile_object_schema(const JsonValue& v) {
     return std::move(built.schema);
 }
 
-// compile_root：根据顶层形态 dispatch
+// compile_root: dispatch by top-level shape
 //   - true            → kAlwaysValid
 //   - false           → kAlwaysInvalid
-//   - {} 空对象        → kAlwaysValid
-//   - {"type":"object", ...} （单 type）→ kObjectRoot（严格 object，非 object 直接 fail）
-//   - 其他            → kValueRoot（properties / items / required 对非匹配类型 vacuous）
+//   - {} empty object  → kAlwaysValid
+//   - {"type":"object", ...} (single type) → kObjectRoot (strict; non-object fails)
+//   - other            → kValueRoot (properties/items/required vacuous on mismatch)
 CompiledSchema compile_root(const JsonValue& v) {
     if (v.is_bool()) {
         CompiledSchema s;
@@ -394,12 +388,12 @@ CompiledSchema compile_root(const JsonValue& v) {
             throw CompileError{"additionalProperties as schema (non-bool) not supported"};
         }
         if (k == "items" && !x.is_object()) {
-            // items: bool / items: [...] (tuple) 暂归 slow path
+            // items: bool / items: [...] (tuple) → slow path for now
             throw CompileError{"items as non-object (bool or array) not supported"};
         }
     }
 
-    // 抽 type；只在 type 恰为单 "object" 时走 kObjectRoot 严格路径
+    // extract type; kObjectRoot strict path only for sole "object" type
     const JsonValue* type_v = nullptr;
     for (auto& [k, x] : root) if (k == "type") { type_v = &x; break; }
     bool type_is_only_object = (type_v && type_v->is_string() && type_v->as_string() == "object");
@@ -408,7 +402,7 @@ CompiledSchema compile_root(const JsonValue& v) {
         return compile_object_schema(v);
     }
 
-    // kValueRoot：构造 1-slot 合成 schema
+    // kValueRoot: build 1-slot synthetic schema
     ValueConstraintBuild vc = compile_value_schema(v);
     CompiledSchema s;
     s.kind                  = SchemaKind::kValueRoot;

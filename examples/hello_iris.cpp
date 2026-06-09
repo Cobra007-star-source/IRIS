@@ -1,11 +1,11 @@
 // =============================================================================
 // examples/hello_iris.cpp
 //
-// 端到端最小可运行 demo:
-//   1. 用 FieldSpec 描述一个 schema
-//   2. 编译为 CompiledSchema (内含完美哈希 + Bitwise type mask)
-//   3. 构造 Validator，自动走双引擎路由
-//   4. 用一组合法/非法 JSON 实测分类
+// Minimal end-to-end demo:
+//   1. Describe schema with FieldSpec
+//   2. Compile to CompiledSchema (perfect hash + bitwise type mask)
+//   3. Build Validator with dual-engine routing
+//   4. Classify valid/invalid JSON samples
 // =============================================================================
 #include <array>
 #include <cstdio>

@@ -1,17 +1,6 @@
 // =============================================================================
-// bench/iris_validate.cpp
-//
-// 标准化 CLI:
-//   iris_validate <schema.json> <data.jsonl> [iterations=1]
-//
-// 行为：
-//   1. 加载 schema → CompiledSchema
-//   2. mmap / 整文件读 data.jsonl
-//   3. 按 '\n' 切片，预存指针（不分配新缓冲）
-//   4. 跑 N 轮验证，统计平均吞吐
-//
-// 故意把 I/O 与解析隔离开（schema 加载、文件读取不计入 bench 时间），
-// 这样和 ajv_bench.mjs 才是 apples-to-apples。
+// iris_validate.cpp
+// Standard benchmark CLI: validate JSONL against a schema (fast or --slow)
 // =============================================================================
 #include <algorithm>
 #include <chrono>
@@ -67,7 +56,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
                      "usage: %s [--slow] <schema.json> <data.jsonl> [iterations=1]\n"
-                     "  --slow : 强制走 SlowSchema 解释器（绕过 Fast Path 编译路径）\n",
+                     "  --slow : force SlowSchema interpreter (bypass fast path compile)\n",
                      argv[0]);
         return 2;
     }
@@ -85,8 +74,8 @@ int main(int argc, char** argv) {
     auto data        = slurp(data_path);
     auto lines       = split_lines(data);
 
-    // 路径 A：Fast Path（默认）—— Validator 构造时自动选路
-    // 路径 B：--slow —— 直接用 SlowSchema + validate_slow_path
+    // Path A: fast path (default) — Validator auto-routes on construction
+    // Path B: --slow — SlowSchema + validate_slow_path directly
     std::unique_ptr<iris::SlowSchema> slow_schema;
     iris::Validator vfast(iris::CompiledSchema{});
 

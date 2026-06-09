@@ -1,10 +1,10 @@
 // =============================================================================
 // benchmarks/validate_bench.cpp
 //
-// 自包含 micro-bench：测 IRIS Fast Path 校验单条 / 批量 JSON 的吞吐。
+// Self-contained micro-bench: fast path throughput single/batch JSON.
 //
-// 不依赖 Google Benchmark，避免引入 fetchcontent 的网络下载。
-// 用 chrono + asm volatile clobber 防止编译器把工作整体优化掉。
+// No Google Benchmark; avoids fetchcontent network download.
+// chrono + asm volatile clobber prevents whole-loop optimization.
 // =============================================================================
 #include <array>
 #include <chrono>
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     const std::vector<std::string> corpus = {
         R"({"name":"Iris","age":24,"email":"hi@iris.dev","active":true})",
         R"({"name":"M2","age":3,"active":false})",
-        R"({"name":"长名字测试","age":100,"email":"x@y.z"})",
+        R"({"name":"long-name-test","age":100,"email":"x@y.z"})",
         R"({"age":12,"name":"out-of-order","active":true})",
         R"({"name":"  spaces  ","age":42})",
     };

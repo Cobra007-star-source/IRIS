@@ -1,20 +1,20 @@
 // =============================================================================
 // iris/parser.hpp
 //
-// Fused Parse & Validate 引擎 (Phase 2 Fast Path)
+// Fused Parse & Validate engine (Phase 2 Fast Path)
 //
-// 设计原则（来自白皮书）：
+// Design principles (from whitepaper):
 //
-//   - Zero-DOM：不在堆上建立 JSON 树，全部在原始 buffer 上扫描
-//   - Zero Allocation：所有状态都在栈上 / 调用方提供的 arena 上
-//   - Bitwise DFA：用类型位掩码替代 if/else 链
-//   - Perfect Hash：字段名 → slot 的 O(1) 跳转
+//   - Zero-DOM: no heap JSON tree; scan raw buffer only
+//   - Zero Allocation: all state on stack / caller-provided arena
+//   - Bitwise DFA: type bit masks instead of if/else chains
+//   - Perfect Hash: O(1) field name -> slot dispatch
 //
-// 当前阶段限制（明确写在文档里，方便后续 Phase 抬升）：
+// Current phase limitations (documented for later upgrades):
 //
-//   - 仅校验单层 object schema
-//   - 数值解析为 int64 / double 二选一，不实现 IEEE-754 精度恢复
-//   - 字符串不做 \u 转义解码（按字节统计长度）
+//   - Single-level object schema validation only
+//   - Numbers as int64 / double only; no full IEEE-754 precision recovery
+//   - Strings: no \u escape decoding (length counted in bytes)
 // =============================================================================
 #pragma once
 
@@ -38,8 +38,8 @@ enum class ValidationError : std::uint8_t {
     kStringTooLong,
     kIntOutOfRange,
     kDuplicateField,
-    // 慢车道相关
-    kNotImplemented,     // 该 schema 关键字尚未支持（落到慢车道但慢车道还未实现）
+    // Slow path related
+    kNotImplemented,     // schema keyword not supported (slow path not implemented)
     kConstMismatch,
     kEnumMismatch,
     kMultipleOf,
@@ -54,28 +54,28 @@ enum class ValidationError : std::uint8_t {
     kNotFailed,
     kIfThenElseFailed,
     kDependentRequired,
-    kSlowSchemaInvalid,  // schema JSON 本身有问题
+    kSlowSchemaInvalid,  // schema JSON itself is invalid
 };
 
 const char* validation_error_name(ValidationError e) noexcept;
 
 struct ValidationReport {
     ValidationError code = ValidationError::kOk;
-    // 出错位置：在原始 buffer 上的字节偏移
+    // Error offset: byte offset in raw buffer
     std::uint32_t   offset = 0;
-    // 出错字段（如已识别）：在 schema field 列表中的 slot；-1 表示未关联具体字段
+    // Error field (if identified): slot in schema field list; -1 if not tied to a field
     std::int32_t    field_slot = -1;
-    // 见过的字段位掩码（调试用）
+    // Seen-field bit mask (debug)
     std::uint64_t   seen_mask = 0;
 
     [[nodiscard]] bool ok() const noexcept { return code == ValidationError::kOk; }
 };
 
-// 主入口：fused 校验 - 不返回任何 DOM、不分配
+// Main entry: fused validation — returns no DOM, allocates nothing
 //
-// data: 原始 JSON 字节流（无需 NUL 终止）
-// size: 字节长度
-// schema: 已编译的 CompiledSchema
+// data: raw JSON bytes (no NUL terminator required)
+// size: byte length
+// schema: compiled CompiledSchema
 ValidationReport validate(const std::uint8_t* IRIS_RESTRICT data,
                           std::size_t size,
                           const CompiledSchema& schema) noexcept;

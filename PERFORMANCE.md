@@ -267,7 +267,7 @@ if (c.data[c.pos + hit] == '"') return CLOSE;
 else c.pos += 2; // skip escape pair
 ```
 
-ARM NEON 实现里这是 `vceqq_u8 → vorrq_u8 → vmaxvq_u8`，1 路 16-byte 步进。
+On ARM NEON this is `vceqq_u8 → vorrq_u8 → vmaxvq_u8`, one 16-byte lane per step.
 
 ### 4.3 Keywords `true/false/null` Using 32-bit Integer Comparison
 
@@ -653,7 +653,7 @@ These two cases `jit_compile()` returns `nullptr`, Validator leaves `path_` at
                   │ │ compile_slow_schema  │ build SlowSchema:
                   │ │   - JsonValue root   │  - raw AST
                   │ │   - refs[pointer →]  │  - $defs / $anchor / $dynamicAnchor index
-                  │ │   - regex_cache[]    │  - RE2 编译 pattern / patternProperties
+                  │ │   - regex_cache[]    │  - RE2 compile pattern / patternProperties
                   │ └─────────┬────────────┘
                   │           │ ok? ──── yes ──► EnginePath::kSlowFallback
                   │           │

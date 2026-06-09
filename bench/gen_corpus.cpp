@@ -1,19 +1,19 @@
 // =============================================================================
 // bench/gen_corpus.cpp
 //
-// 生成 ajv-style benchmark 语料。两组：
+// Generate ajv-style benchmark corpus. Two sets:
 //
-//   flat/    扁平 4 字段 person schema（与 ajv 对比的"小而典型"）
-//   nested/  含嵌套 object + array-of-object 的"接近真实业务"语料
+//   flat/    flat 4-field person schema (small, typical, vs ajv)
+//   nested/  nested object + array-of-object (closer to real workloads)
 //
-// 用法：
+// Usage:
 //   gen_corpus <out_dir> [count=1000000]
 //
-// 输出文件：
+// Output files:
 //   <out_dir>/flat/{schema.json, data.jsonl, bad.jsonl}
 //   <out_dir>/nested/{schema.json, data.jsonl}
 //
-// 所有随机使用固定 seed=0xC0FFEE，保证跨平台可复现。
+// Fixed seed=0xC0FFEE for reproducibility.
 // =============================================================================
 #include <cstdio>
 #include <cstdint>
@@ -123,13 +123,13 @@ const T& pick(const T (&arr)[N], std::mt19937_64& rng) {
 void emit_nested_record(std::ostream& out, std::mt19937_64& rng) {
     out << R"({"id":)" << (rng() % 1'000'000)
         << R"(,"name":")" << make_name(rng) << R"(")";
-    if ((rng() & 1u) != 0) {  // addr 可选
+    if ((rng() & 1u) != 0) {  // addr optional
         out << R"(,"addr":{"city":")" << pick(kCities, rng) << R"(")";
         if ((rng() & 1u) != 0) out << R"(,"country":")" << pick(kCountries, rng) << R"(")";
         if ((rng() & 3u) == 0) out << R"(,"zip":")" << (rng() % 100000) << R"(")";
         out << "}";
     }
-    if ((rng() & 1u) != 0) {  // tags 可选
+    if ((rng() & 1u) != 0) {  // tags optional
         out << R"(,"tags":[)";
         int n = static_cast<int>(rng() % 4);
         for (int i = 0; i < n; ++i) {
@@ -138,7 +138,7 @@ void emit_nested_record(std::ostream& out, std::mt19937_64& rng) {
         }
         out << "]";
     }
-    if ((rng() & 3u) != 0) {  // events 经常出现
+    if ((rng() & 3u) != 0) {  // events often present
         out << R"(,"events":[)";
         int n = static_cast<int>(rng() % 4);
         for (int i = 0; i < n; ++i) {
@@ -152,7 +152,7 @@ void emit_nested_record(std::ostream& out, std::mt19937_64& rng) {
 }
 
 void emit_bad_record(std::ostream& out, std::mt19937_64& rng) {
-    // 各种违反方式按经验比例混合
+    // mix violation kinds by empirical ratios
     int kind = static_cast<int>(rng() % 6);
     switch (kind) {
         case 0:  // missing required age

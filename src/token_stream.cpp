@@ -1,7 +1,6 @@
 // =============================================================================
-// src/token_stream.cpp
-//
-// SoA token 存储的纯 PoD 容器。
+// token_stream.cpp
+// Plain PoD container for SoA token storage
 // =============================================================================
 #include "iris/token_stream.hpp"
 

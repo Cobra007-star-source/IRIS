@@ -1,9 +1,9 @@
 // =============================================================================
 // iris/validator.hpp
 //
-// 公共 API：双引擎入口。
+// Public API: dual-engine entry.
 //
-// 用法：
+// Usage:
 //
 //   iris::FieldSpec fields[] = { ... };
 //   auto built = iris::compile_schema(fields);
@@ -46,15 +46,15 @@ struct ValidatorBuild {
 
 class Validator : public NonCopyable {
 public:
-    // 经典入口：直接接收已经走过 Fast Path 的 CompiledSchema。保留兼容。
+    // Classic entry: accepts CompiledSchema that already passed Fast Path. Kept for compatibility.
     explicit Validator(CompiledSchema schema,
                        SchemaInspectionInput inspection = {});
 
-    // 新入口（推荐）：直接吃 schema JSON 字符串，自动做 fast↔slow 路由。
-    //   1. 先尝试 compile_schema_from_json（Fast Path，CompiledSchema/SoA）
-    //   2. 若 Fast Path 拒绝（含 unsupported keyword），fallback 到
-    //      compile_slow_schema（Slow Path，JsonValue AST + RE2 缓存 + $ref 表）
-    //   3. 若两者都失败，build.ok=false，diagnostic 给原因
+    // Recommended entry: schema JSON string with automatic fast/slow routing.
+    //   1. Try compile_schema_from_json (Fast Path, CompiledSchema/SoA)
+    //   2. On Fast Path rejection (unsupported keyword), fallback to
+    //      compile_slow_schema (Slow Path, JsonValue AST + RE2 cache + $ref table)
+    //   3. If both fail, build.ok=false with diagnostic
     [[nodiscard]] static Validator from_schema_json(std::string_view schema_json,
                                                     ValidatorBuild& out_build);
 
@@ -69,10 +69,9 @@ public:
     [[nodiscard]] bool has_fast_path() const noexcept { return has_fast_; }
     [[nodiscard]] bool has_slow_path() const noexcept { return slow_schema_ != nullptr; }
 
-    // 把一份外部文档注册进当前 Validator 的 Slow 引擎，使后续 $ref 可解析。
-    // 仅在 has_slow_path() 为 true 时生效；如果当前路径只走 Fast，会自动
-    // 把 schema 切回 Slow（重新编译 schema 失败时这一项会安静失败）。
-    // 返回是否成功登记。
+    // Register an external document for Slow engine $ref resolution.
+    // Only when has_slow_path(); if only Fast Path, switches back to Slow (re-compile).
+    // Returns whether registration succeeded.
     bool add_remote_document(std::string uri, std::string_view json) noexcept;
 
 private:

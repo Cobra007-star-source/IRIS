@@ -1,43 +1,6 @@
 // =============================================================================
-// src/slow_eval.cpp
-//
-// 慢车道核心：JSON Schema 2020-12 关键字递归解释器。
-//
-// 设计要点
-// --------
-//
-//   * 关键字模型 — 每个 keyword 是一个独立"约束谓词"。它对 instance 是否生效
-//     由 instance 的形态决定：例如 "properties" 仅当 instance 是 object 时生效，
-//     "minLength" 仅当 instance 是 string 时生效。所有谓词组合为 conjunction
-//     （所有都必须通过）。schema = 谓词集合。
-//
-//   * allOf / anyOf / oneOf / not 是"组合子"：递归 eval 子 schema 后做布尔归约。
-//     allOf 短路在第一个 false；anyOf 短路在第一个 true；oneOf 必须严格等于 1
-//     的 true（不能短路，必须看完）。
-//
-//   * $ref：v1 仅同文档。预编译期 SlowSchema 已建好 refs 表。
-//     防御递归深度爆炸：MAX_DEPTH = 128。
-//
-//   * pattern：预编译 RE2（若有），否则懒编译 std::regex。所有正则都按
-//     ECMA-262 partial-match 语义（注：JSON Schema 用 partial match，
-//     即不要求锚定 ^...$，但 RE2.PartialMatch / std::regex_search 等价）。
-//
-//   * format：默认 annotation-only（spec 默认）。但 format-assertion 子集
-//     这里实现了：date / date-time / time / email / ipv4 / ipv6 / uri /
-//     uri-reference / uuid / hostname / regex / json-pointer。
-//
-//   * 浮点：multipleOf 用 fmod 计算余数；JSON Schema 定义 "remainder of
-//     dividing instance by divisor is zero"。注意：1.0e1 这种符号化为整型
-//     时仍按 double 比较；与 fast path 的 min_dbl/max_dbl 一致。
-//
-//   * Unicode：min/maxLength 按 codepoint 计数（UTF-8 byte-prefix 法），
-//     而不是字节。这是 Fast Path 当前缺的能力。
-//
-//   * unevaluatedProperties / unevaluatedItems：需要 annotation tracking
-//     （即记录哪些 properties 已经被 properties/patternProperties/$ref 等
-//     消费过）。v1 实现里 unevaluatedProperties 仅在没有 properties/
-//     patternProperties/additionalProperties 时生效——这是一个简化近似，
-//     conformance 测试集对它的覆盖率会偏低。完整实现 deferred。
+// slow_eval.cpp
+// Slow path: recursive JSON Schema 2020-12 keyword interpreter
 // =============================================================================
 #include "iris/slow_schema.hpp"
 
@@ -58,9 +21,9 @@ extern const JsonValue& metaschema_sentinel();
 
 namespace {
 
-// 解析 schema 的 $schema → 找远端 metaschema → 看 $vocabulary 是否声明 validation
-// vocab。若否（或 false），返回 true 表示该 schema 在 validate 时应跳过所有
-// validation 类关键字。spec §8.1。
+// Parse $schema → remote metaschema → check $vocabulary for validation
+// vocab. If absent/false, return true: skip all validation keywords (spec §8.1).
+// (see above)
 bool check_validation_vocab_disabled(const SlowSchema& s) {
     if (!s.root.is_object()) return false;
     const JsonValue* meta_url = s.root.find("$schema");
@@ -78,9 +41,9 @@ bool check_validation_vocab_disabled(const SlowSchema& s) {
     };
     for (const char* u : kValidationUris) {
         const JsonValue* v = voc->find(u);
-        if (v && v->is_bool() && v->as_bool()) return false;  // 显式 true → 启用
+        if (v && v->is_bool() && v->as_bool()) return false;  // explicit true → enabled
     }
-    return true;  // 都没声明（或为 false）→ 禁用
+    return true;  // not declared or false → disabled
 }
 
 }  // namespace
@@ -92,7 +55,7 @@ extern bool slow_regex_validate(std::string_view) noexcept;
 namespace {
 
 // -----------------------------------------------------------------------------
-// 工具：ValidationReport 构造
+// Utilities: ValidationReport construction
 // -----------------------------------------------------------------------------
 inline ValidationReport ok_report() noexcept { return {}; }
 inline ValidationReport err_report(ValidationError c) noexcept {
@@ -100,12 +63,12 @@ inline ValidationReport err_report(ValidationError c) noexcept {
 }
 
 // -----------------------------------------------------------------------------
-// JsonValue 深度等价（用于 const / enum / uniqueItems）
+// JsonValue deep equality (const / enum / uniqueItems)
 // -----------------------------------------------------------------------------
 bool json_eq(const JsonValue& a, const JsonValue& b) {
     using T = JsonValue::Type;
     if (a.is_number() && b.is_number()) {
-        // JSON Schema spec：两个 number 相等当且仅当数学相等
+        // JSON Schema: numbers equal iff mathematically equal
         double da = a.as_double(), db = b.as_double();
         return da == db;
     }
@@ -126,7 +89,7 @@ bool json_eq(const JsonValue& a, const JsonValue& b) {
         case T::kObject: {
             const auto& ao = a.as_object(); const auto& bo = b.as_object();
             if (ao.size() != bo.size()) return false;
-            // 不要求键顺序一致
+            // key order not required
             for (auto& [k, v] : ao) {
                 const JsonValue* m = b.find(k);
                 if (!m || !json_eq(v, *m)) return false;
@@ -138,7 +101,7 @@ bool json_eq(const JsonValue& a, const JsonValue& b) {
 }
 
 // -----------------------------------------------------------------------------
-// Unicode codepoint 计数
+// Unicode codepoint count
 // -----------------------------------------------------------------------------
 std::size_t utf8_codepoints(std::string_view s) noexcept {
     std::size_t cnt = 0;
@@ -148,14 +111,14 @@ std::size_t utf8_codepoints(std::string_view s) noexcept {
         else if ((c & 0xE0) == 0xC0) i += 2;
         else if ((c & 0xF0) == 0xE0) i += 3;
         else if ((c & 0xF8) == 0xF0) i += 4;
-        else i += 1;  // malformed → 当 1 字节
+        else i += 1;  // malformed → count as 1 byte
         ++cnt;
     }
     return cnt;
 }
 
 // -----------------------------------------------------------------------------
-// type keyword 检查
+// type keyword check
 // -----------------------------------------------------------------------------
 bool type_matches_one(std::string_view tn, const JsonValue& v) noexcept {
     using T = JsonValue::Type;
@@ -187,27 +150,27 @@ bool type_matches(const JsonValue& type_node, const JsonValue& instance) noexcep
 }
 
 // -----------------------------------------------------------------------------
-// 数字 keyword
+// numeric keywords
 // -----------------------------------------------------------------------------
 bool check_multiple_of(double instance, double divisor) noexcept {
     if (divisor == 0.0) return false;
     double q = instance / divisor;
-    if (!std::isfinite(q)) return false;   // overflow → 永远不能整除
-    // 允许 ulp 级别误差。JSON Schema 测试集里 0.0075 / 0.0001 = 75，但 IEEE-754
-    // 可能算出 74.999999...。这里用 4 ulp 容差。
+    if (!std::isfinite(q)) return false;   // overflow → never divisible
+    // Allow ulp tolerance. Test suite: 0.0075/0.0001=75 but IEEE-754
+    // may yield 74.999999...; use 1e-9 tolerance here.
     double r = std::round(q);
     return std::fabs(q - r) < 1e-9;
 }
 
 // -----------------------------------------------------------------------------
-// 正则：通过 slow_schema.cpp 的不透明 CompiledRegex 接口
+// Regex via opaque CompiledRegex from slow_schema.cpp
 // -----------------------------------------------------------------------------
 bool regex_search_partial(const SlowSchema& schema, const JsonValue* pat_node,
                           std::string_view text) noexcept {
     if (const CompiledRegex* r = slow_lookup_regex(schema, pat_node)) {
         return slow_regex_match(*r, text);
     }
-    // cache miss → fallback：现场编译
+    // cache miss → compile inline
     if (!pat_node->is_string()) return false;
     return slow_regex_match_inline(pat_node->as_string(), text);
 }
@@ -217,7 +180,7 @@ bool regex_search_inline(std::string_view pattern, std::string_view text) noexce
 }
 
 // -----------------------------------------------------------------------------
-// format 检查（subset，draft 2020-12 默认 annotation；这里按 assertion 实现）
+// format checks (subset; draft 2020-12 default annotation; implemented as assertion)
 // -----------------------------------------------------------------------------
 bool is_digits(std::string_view s) noexcept {
     if (s.empty()) return false;
@@ -252,7 +215,7 @@ bool format_time(std::string_view s) noexcept {
     int hh = (s[0]-'0')*10 + (s[1]-'0');
     int mm = (s[3]-'0')*10 + (s[4]-'0');
     int ss = (s[6]-'0')*10 + (s[7]-'0');
-    if (hh > 23 || mm > 59 || ss > 60) return false;  // 60 允许 leap second
+    if (hh > 23 || mm > 59 || ss > 60) return false;  // 60 allows leap second
     std::size_t i = 8;
     if (i < s.size() && s[i] == '.') {
         ++i;
@@ -260,7 +223,7 @@ bool format_time(std::string_view s) noexcept {
         while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
         if (i == start) return false;
     }
-    if (i == s.size()) return false;  // 必须有 timezone
+    if (i == s.size()) return false;  // timezone required
     if (s[i] == 'Z' || s[i] == 'z') { ++i; return i == s.size(); }
     if (s[i] != '+' && s[i] != '-') return false;
     if (i + 6 != s.size()) return false;
@@ -274,7 +237,7 @@ bool format_date_time(std::string_view s) noexcept {
 }
 
 bool format_email(std::string_view s) noexcept {
-    // RFC 5322 简化版
+    // simplified RFC 5322
     auto at = s.find('@');
     if (at == std::string_view::npos || at == 0 || at == s.size() - 1) return false;
     auto local = s.substr(0, at);
@@ -297,7 +260,7 @@ bool format_ipv4(std::string_view s) noexcept {
             if (cur < 0 || cur > 255) return false;
             ++dots; cur = -1;
         } else if (c >= '0' && c <= '9') {
-            // 不允许前导零（除了 0 本身）
+            // no leading zeros except 0 itself
             if (cur == 0) return false;
             cur = (cur < 0 ? 0 : cur) * 10 + (c - '0');
             if (cur > 255) return false;
@@ -307,7 +270,7 @@ bool format_ipv4(std::string_view s) noexcept {
 }
 
 bool format_ipv6(std::string_view s) noexcept {
-    // 简化：8 组 1-4 位 hex，用 ":" 分隔，允许一次 "::" 压缩。
+    // simplified: 8 groups of 1-4 hex, ":", one "::" compression allowed
     if (s.empty()) return false;
     std::vector<std::string_view> groups;
     bool has_dbl = false;
@@ -384,7 +347,7 @@ bool format_regex(std::string_view s) noexcept {
 }
 
 bool format_json_pointer(std::string_view s) noexcept {
-    if (s.empty()) return true;  // "" 是合法的 root pointer
+    if (s.empty()) return true;  // "" is valid root pointer
     if (s.front() != '/') return false;
     for (std::size_t i = 1; i < s.size(); ++i) {
         if (s[i] == '~') {
@@ -404,7 +367,7 @@ bool check_format(std::string_view fmt, std::string_view text) noexcept {
     if (fmt == "ipv4")          return format_ipv4(text);
     if (fmt == "ipv6")          return format_ipv6(text);
     if (fmt == "uri")           return format_uri(text);
-    if (fmt == "uri-reference") return true;  // 任何字符串都是合法的 uri-reference
+    if (fmt == "uri-reference") return true;  // any string is valid uri-reference
     if (fmt == "iri")           return format_uri(text);
     if (fmt == "iri-reference") return true;
     if (fmt == "uuid")          return format_uuid(text);
@@ -412,25 +375,25 @@ bool check_format(std::string_view fmt, std::string_view text) noexcept {
     if (fmt == "idn-hostname")  return format_hostname(text);
     if (fmt == "regex")         return format_regex(text);
     if (fmt == "json-pointer")  return format_json_pointer(text);
-    if (fmt == "relative-json-pointer") return true;  // 简化
+    if (fmt == "relative-json-pointer") return true;  // simplified
     if (fmt == "duration")      return !text.empty() && text.front() == 'P';
-    // 未知 format：spec 默认 annotation-only，按通过处理
+    // unknown format: spec default annotation-only → pass
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// 递归求值
+// Recursive evaluation
 // -----------------------------------------------------------------------------
-// 动态作用域栈帧：记录"目前 evaluator 进入过的 schema resource"链。
-// JSON Schema 2020-12 §8.2.3.2：dynamic scope 由若干 schema resource 组成，
-// 每个 resource 以 $id 为边界。$dynamicRef "#name" 的解析顺序是：
-//   1. 静态解析得到 target T；
-//   2. 若 T 自己含 $dynamicAnchor=name，进入动态模式：
-//      从 dynamic_scope 最外层（栈底）向内扫，找第一个 resource 里有
-//      $dynamicAnchor=name 的 subschema 作为真目标。$defs 里的也算，
-//      只要它在该 resource 边界内。
-// 因此每帧只需要记录"该 frame 的 base URI"即可——通过 resources 表
-// `<frame.base>#<anchor>` 反查命中点。
+// Dynamic scope frames: chain of schema resources entered by evaluator.
+// JSON Schema 2020-12 §8.2.3.2: dynamic scope is schema resources,
+// each bounded by $id. $dynamicRef "#name" resolution:
+//   1. static resolution to target T;
+//   2. if T has $dynamicAnchor=name, dynamic mode:
+//      scan dynamic_scope outer→inner for first $dynamicAnchor=name;
+//      $defs entries count if inside resource boundary.
+//      (continued)
+// Each frame stores base URI; lookup via resources
+// `<frame.base>#<anchor>`.
 struct DynamicFrame {
     std::string base_uri;
 };
@@ -438,17 +401,17 @@ struct DynamicFrame {
 struct EvalCtx {
     const SlowSchema& schema;
     int depth = 0;
-    // 当前有效 base URI，沿 $id 路径维护（push/pop）。
-    // 用于 $ref / $dynamicRef 按 RFC 3986 做相对解析。
+    // current effective base URI along $id path (push/pop).
+    // for $ref / $dynamicRef relative resolution per RFC 3986.
     std::string current_base;
-    // 动态作用域栈（spec 8.2.3.2）。RAII 在 eval_object_keywords 入口处推。
+    // dynamic scope stack (spec 8.2.3.2); pushed at eval_object_keywords entry.
     std::vector<DynamicFrame> dynamic_scope;
     static constexpr int kMaxDepth = 256;
 };
 
-// 进入一个 subschema 节点时切换 current_base。优先用索引阶段算好的 node_base
-// （它正是"$id 应用之后"的 base）；这避免 $ref 跳转后再做一次 resolve 导致 base 累加。
-// 返回旧 base 以便函数退出时还原。
+// On subschema entry switch current_base; prefer indexed node_base
+// (base after $id); avoids double resolve on $ref jump stacking bases.
+// Returns saved base for restore on exit.
 inline std::string push_id_scope_for_node(const JsonValue& node, EvalCtx& ctx) {
     std::string saved = ctx.current_base;
     if (const std::string* nb = slow_node_base(ctx.schema, &node)) {
@@ -459,20 +422,20 @@ inline std::string push_id_scope_for_node(const JsonValue& node, EvalCtx& ctx) {
 
 ValidationReport eval(const JsonValue& schema_node, const JsonValue& instance, EvalCtx& ctx);
 
-// 已被 properties / patternProperties / additionalProperties 等消费过的属性，
-// 用于实现 unevaluatedProperties。简化版：仅 properties + patternProperties
-// 标记，additionalProperties 与 unevaluatedProperties 自身不互相影响。
+// Properties consumed by properties/patternProperties/additionalProperties,
+// for unevaluatedProperties. Simplified: only properties + patternProperties
+// marked; additionalProperties vs unevaluatedProperties independent.
 //
-// 完整实现需要"annotation collection"：当 $ref / allOf 子 schema 同样使用了
-// properties 时，必须合并它们的 evaluated 集合。这是 unevaluatedProperties
-// 测试集中失败的主要原因，v1 接受这个近似。
+// Full impl needs annotation collection: merge evaluated sets from $ref/allOf
+// subschemas using properties. Main source of unevaluatedProperties test gaps;
+// v1 accepts this approximation.
 
 ValidationReport eval_object_keywords(const JsonObject& schema_obj,
                                       const JsonValue& instance,
                                       EvalCtx& ctx);
 
 // -----------------------------------------------------------------------------
-// keyword 处理：返回 ok 表示该 keyword 通过（包括 vacuous）
+// keyword handlers: ok means passed (including vacuous)
 // -----------------------------------------------------------------------------
 
 ValidationReport handle_const(const JsonValue& v, const JsonValue& inst, const SlowSchema& s) {
@@ -523,26 +486,26 @@ ValidationReport handle_string_kw(std::string_view k, const JsonValue& v,
         if (!regex_search_partial(schema, &v, s))
             return err_report(ValidationError::kPatternMismatch);
     } else if (k == "format") {
-        // draft 2020-12 spec：format 默认是 annotation-only。
-        // format-assertion vocabulary 才把它当 assertion；当前 IRIS 没有显式开启
-        // 该 vocabulary，因此与官方 reference impl 一致——任何 format 值都通过。
-        // check_format() 仍保留：format-assertion 模式开通后可一行翻开。
+        // draft 2020-12: format default annotation-only.
+        // format-assertion vocabulary treats as assertion; IRIS does not enable it;
+        // matches reference impl — any format passes.
+        // check_format() kept for one-line enable when format-assertion is on.
         (void)v; (void)s; (void)schema;
     }
     return ok_report();
 }
 
-// Annotations 维护：用于 unevaluatedProperties / unevaluatedItems / minContains
-// 等需要"sibling 通信"的关键字。每次 eval(...) 都接收一个 Annotations，
-// 内部 keyword handler 在求值成功时往里追加它消费过的属性 / 项。
+// Annotations for unevaluatedProperties / unevaluatedItems / minContains
+// and sibling-communicating keywords. Each eval(...) receives Annotations;
+// handlers append consumed props/items on success.
 //
-// 注意：only "successful subschema" 才贡献 annotation——这是 spec 的关键规则，
-// 也是 unevaluatedItems with not 等测试 case 的关键判定。
+// Only successful subschemas contribute annotations (spec rule);
+// critical for unevaluatedItems with not cases.
 struct Annotations {
-    std::vector<std::string> evaluated_props;     // properties / patternProperties / additionalProperties 消费过的字段名
-    bool                     all_items_seen = false;  // items（单 schema 形态）
-    std::size_t              prefix_items_seen = 0;   // prefixItems / items-as-array 消费的索引数
-    std::vector<std::size_t> contains_indices;     // contains 命中的索引
+    std::vector<std::string> evaluated_props;     // field names consumed by properties/patternProperties/additionalProperties
+    bool                     all_items_seen = false;  // items (single-schema form)
+    std::size_t              prefix_items_seen = 0;   // indices consumed by prefixItems / items-as-array
+    std::vector<std::size_t> contains_indices;     // indices matched by contains
 };
 
 inline void merge_ann(Annotations& dst, const Annotations& src) {
@@ -555,13 +518,13 @@ inline void merge_ann(Annotations& dst, const Annotations& src) {
 ValidationReport eval_with_ann(const JsonValue& schema_node, const JsonValue& instance,
                                EvalCtx& ctx, Annotations& ann);
 
-// 处理"数组簇"：items / prefixItems / contains / additionalItems / minContains /
-// maxContains / unevaluatedItems。它们必须协同求值才能维持 annotation 一致性。
+// Array cluster: items / prefixItems / contains / additionalItems / minContains /
+// maxContains / unevaluatedItems — joint eval for annotation consistency.
 ValidationReport process_array_cluster(const JsonObject& schema_obj,
                                        const JsonValue& inst,
                                        EvalCtx& ctx, Annotations& ann);
 
-// 处理"对象簇"：properties / patternProperties / additionalProperties /
+// Object cluster: properties / patternProperties / additionalProperties /
 // unevaluatedProperties / required / dependentRequired / dependentSchemas /
 // propertyNames / min/maxProperties。
 ValidationReport process_object_cluster(const JsonObject& schema_obj,
@@ -573,7 +536,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
                                       EvalCtx& ctx,
                                       Annotations& ann) {
 
-    // type 优先（短路）。validation vocab 关闭时跳过。
+    // type first (short-circuit). Skip when validation vocab disabled.
     if (ctx.schema.disable_validation_vocab != 1) {
         for (auto& [k, v] : schema_obj) {
             if (k == "type") {
@@ -584,7 +547,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
         }
     }
 
-    // 检测是否有数组/对象 cluster keyword：有的话最后做协同处理
+    // detect array/object cluster keywords for joint processing at end
     bool has_array_cluster  = false;
     bool has_object_cluster = false;
 
@@ -607,8 +570,8 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
             if (++ctx.depth > EvalCtx::kMaxDepth)
                 return err_report(ValidationError::kSlowSchemaInvalid);
             Annotations sub_ann;
-            // base 切换由 eval_with_ann 内的 push_id_scope_for_node 处理（直接读
-            // 索引期算好的 node_base，避免重复 $id resolve 导致 base 累加）。
+            // base switch in eval_with_ann via push_id_scope_for_node (reads
+            // indexed node_base; avoids stacked $id resolve on $ref).
             auto r = eval_with_ann(*target, instance, ctx, sub_ann);
             --ctx.depth;
             if (!r.ok()) return r;
@@ -616,14 +579,14 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
             continue;
         }
         if (k == "$dynamicRef") {
-            // JSON Schema 2020-12 §8.2.3.2 动态引用解析：
-            //   1. 静态地按 $ref 规则解析 v 到 target T。
-            //   2. 取 ref 的 fragment 名字（"#name" 部分）。
-            //   3. 如果 T 自己声明了 $dynamicAnchor = name，则进入"动态模式"：
-            //      从当前 dynamic_scope 的最外层（栈底）向栈顶扫，找第一个声明
-            //      了 $dynamicAnchor = name 的 frame，那个 frame 的目标 schema
-            //      就是真目标。否则用 T 自己。
-            //   4. 没有 fragment（罕见）或 T 不含同名 $dynamicAnchor：当作 $ref。
+            // JSON Schema 2020-12 §8.2.3.2 dynamic reference resolution:
+            //   1. resolve v to target T like $ref.
+            //   2. extract fragment name ("#name").
+            //   3. if T declares $dynamicAnchor = name, dynamic mode:
+            //      scan dynamic_scope bottom→top for first frame with
+            //      $dynamicAnchor = name; use that schema as target.
+            //      else use T.
+            //   4. no fragment or no matching $dynamicAnchor: treat as $ref.
             if (!v.is_string()) return err_report(ValidationError::kSlowSchemaInvalid);
             const std::string& ref_str = v.as_string();
             const JsonValue* target = slow_resolve_ref_uri(ctx.schema,
@@ -631,14 +594,14 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
                                                            ref_str);
             if (!target) return err_report(ValidationError::kSlowSchemaInvalid);
 
-            // 取 fragment 部分
+            // extract fragment
             std::string_view rv(ref_str);
             std::string anchor;
             auto h = rv.find('#');
             if (h != std::string_view::npos) {
                 anchor.assign(rv.data() + h + 1, rv.size() - h - 1);
             }
-            // 检查 target 是否真带 $dynamicAnchor = anchor
+            // check target has $dynamicAnchor = anchor
             bool target_has_dyn = false;
             if (!anchor.empty() && target->is_object()) {
                 for (auto& [tk, tv] : target->as_object()) {
@@ -650,10 +613,10 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
                 }
             }
             if (target_has_dyn && !ctx.dynamic_scope.empty()) {
-                // 从最外层（栈底）向内（栈顶）扫每一帧。对每帧，按
-                // `<frame.base>#<anchor>` 去 resources 反查；若命中的节点
-                // 实际带 $dynamicAnchor=anchor（防御误匹配到 $anchor），则
-                // 取它为真目标。第一个命中即胜出。
+                // scan frames outer→inner; for each, lookup
+                // `<frame.base>#<anchor>` in resources; if hit node
+                // has $dynamicAnchor=anchor (not plain $anchor),
+                // use as target; first win.
                 for (auto& f : ctx.dynamic_scope) {
                     std::string key = f.base_uri;
                     key.push_back('#');
@@ -698,7 +661,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
                 Annotations sub_ann;
                 if (eval_with_ann(sub, instance, ctx, sub_ann).ok()) {
                     any = true;
-                    merge_ann(ann, sub_ann);   // 所有成功分支都贡献 annotation
+                    merge_ann(ann, sub_ann);   // all successful branches contribute annotations
                 }
             }
             if (!any) return err_report(ValidationError::kAnyOfFailed);
@@ -721,7 +684,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
             continue;
         }
         if (k == "not") {
-            // not 永远不贡献 annotation（spec 明确：not 不收集 annotation）
+            // not never contributes annotations (spec: not collects none)
             Annotations dropped;
             if (eval_with_ann(v, instance, ctx, dropped).ok())
                 return err_report(ValidationError::kNotFailed);
@@ -730,7 +693,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
         if (k == "if") {
             Annotations cond_ann;
             bool if_ok = eval_with_ann(v, instance, ctx, cond_ann).ok();
-            if (if_ok) merge_ann(ann, cond_ann);  // 满足条件的 if 子句贡献 annotation
+            if (if_ok) merge_ann(ann, cond_ann);  // matching if branch contributes annotation
             const JsonValue* branch = nullptr;
             for (auto& [k2, v2] : schema_obj) {
                 if (if_ok && k2 == "then") { branch = &v2; break; }
@@ -773,7 +736,7 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
             has_object_cluster = true;
             continue;
         }
-        // 未识别 keyword：按 annotation-only 忽略
+        // unknown keyword: ignore as annotation-only
     }
 
     if (has_array_cluster && instance.is_array()) {
@@ -787,10 +750,9 @@ ValidationReport eval_object_keywords(const JsonObject& schema_obj,
     return ok_report();
 }
 
-// 内嵌的"是否合法 JSON Schema 关键字结构"轻量校验。仅在 $ref 指向 metaschema
-// 时启用——避免实现完整 metaschema validator（约 5KB schema + 自引用复杂度）。
-// 覆盖常用关键字的类型约束，足以分辨 test suite 里的 "valid/invalid definition
-// schema"、"remote ref valid/invalid" 这类 case。
+// Lightweight valid-schema check when $ref targets metaschema
+// avoids full metaschema validator (~5KB + self-reference).
+// Covers common keyword type constraints for definition / remote ref cases.
 bool builtin_is_valid_schema(const JsonValue& v);
 
 bool valid_schema_obj(const JsonValue& v) {
@@ -868,7 +830,7 @@ bool builtin_is_valid_schema(const JsonValue& v) {
             k == "unevaluatedProperties" || k == "not" || k == "if" ||
             k == "then" || k == "else" || k == "additionalItems" ||
             k == "contentSchema") {
-            // 2020-12 里 "items" 也可以是 schema-array (legacy)
+            // in 2020-12 "items" may also be a schema-array (legacy)
             if (sv.is_array()) {
                 for (auto& e : sv.as_array())
                     if (!valid_schema_obj(e)) return false;
@@ -896,17 +858,17 @@ bool builtin_is_valid_schema(const JsonValue& v) {
         }
         if (k == "const" || k == "default" || k == "examples" || k == "readOnly" ||
             k == "writeOnly" || k == "deprecated" || k == "$vocabulary") {
-            // 不约束
+            // no constraint
             continue;
         }
-        // 其它（自定义）关键字按 spec 默认 annotation-only，允许。
+        // other (custom) keywords: spec default annotation-only, allowed.
     }
     return true;
 }
 
 ValidationReport eval_with_ann(const JsonValue& schema_node, const JsonValue& instance,
                                EvalCtx& ctx, Annotations& ann) {
-    // 命中 metaschema sentinel：用内嵌轻量 schema 合法性检查器。
+    // metaschema sentinel hit: use embedded lightweight schema validity checker.
     if (&schema_node == &metaschema_sentinel()) {
         return builtin_is_valid_schema(instance)
                    ? ok_report()
@@ -918,16 +880,16 @@ ValidationReport eval_with_ann(const JsonValue& schema_node, const JsonValue& in
     }
     if (!schema_node.is_object()) return err_report(ValidationError::kSlowSchemaInvalid);
 
-    // 切换到该 subschema 的 base URI 作用域。索引阶段已经把"$id 应用之后的
-    // base"算好存进 node_base，直接复用避免重复 resolve。
+    // Switch to this subschema's base URI scope. Indexing stored post-$id base in
+    // node_base; reuse it to avoid duplicate resolve.
     struct BaseGuard {
         EvalCtx& ctx; std::string saved;
         ~BaseGuard() { ctx.current_base = std::move(saved); }
     };
     BaseGuard guard{ctx, push_id_scope_for_node(schema_node, ctx)};
 
-    // 进入新的 schema resource（由 $id 边界判定）时，推入 dynamic_scope 帧。
-    // 用"saved（旧 base）与 current_base 不等"判定是否跨边界；起始空栈也算一帧。
+    // On entering a new schema resource ($id boundary), push dynamic_scope frame.
+    // Cross-boundary when saved base != current_base; empty stack counts as a frame.
     struct DynGuard {
         EvalCtx& ctx; bool active;
         ~DynGuard() { if (active) ctx.dynamic_scope.pop_back(); }
@@ -948,14 +910,13 @@ ValidationReport eval(const JsonValue& schema_node, const JsonValue& instance, E
 }
 
 // -----------------------------------------------------------------------------
-// 数组簇协同处理（items / prefixItems / contains / additionalItems /
-//                  min/maxItems / uniqueItems / min/maxContains / unevaluatedItems）
+// Array cluster joint processing (items / prefixItems / contains / additionalItems /
+//                                 min/maxItems / uniqueItems / min/maxContains / unevaluatedItems)
 //
-// 与单个 keyword 顺序处理的区别：
-//   * additionalItems 必须知道 items-as-array 的 prefix 长度
-//   * minContains / maxContains 必须知道 contains 命中数
-//   * unevaluatedItems 必须知道 items / prefixItems 消费过哪些索引（含通过
-//     $ref / allOf / anyOf 间接消费的）
+// Unlike per-keyword sequential handling:
+//   * additionalItems needs items-as-array prefix length
+//   * minContains / maxContains need contains hit count
+//   * unevaluatedItems needs indices consumed by items/prefixItems (incl. via $ref/allOf/anyOf)
 // -----------------------------------------------------------------------------
 ValidationReport process_array_cluster(const JsonObject& schema_obj,
                                        const JsonValue& inst,
@@ -1002,7 +963,7 @@ ValidationReport process_array_cluster(const JsonObject& schema_obj,
         }
     }
 
-    // prefixItems / items-as-array：消费 prefix
+    // prefixItems / items-as-array: consume prefix
     std::size_t prefix_consumed = 0;
     if (prefix_v && prefix_v->is_array()) {
         const auto& pf = prefix_v->as_array();
@@ -1026,7 +987,7 @@ ValidationReport process_array_cluster(const JsonObject& schema_obj,
     }
     ann.prefix_items_seen = std::max(ann.prefix_items_seen, prefix_consumed);
 
-    // items (单 schema 形态) 应用于 prefix 之后的元素
+    // items (single-schema form) applies to elements after prefix
     if (items_v && !items_v->is_array()) {
         if (items_v->is_bool()) {
             if (!items_v->as_bool() && prefix_consumed < arr.size())
@@ -1038,10 +999,10 @@ ValidationReport process_array_cluster(const JsonObject& schema_obj,
                 if (!r.ok()) return r;
             }
         }
-        ann.all_items_seen = true;   // 单 schema items 等价"全部被覆盖"
+        ann.all_items_seen = true;   // single-schema items means all indices covered
     }
 
-    // additionalItems：与 items-as-array 配对
+    // additionalItems: paired with items-as-array
     if (add_items_v && items_v && items_v->is_array()) {
         for (std::size_t i = prefix_consumed; i < arr.size(); ++i) {
             if (add_items_v->is_bool()) {
@@ -1075,7 +1036,7 @@ ValidationReport process_array_cluster(const JsonObject& schema_obj,
         for (auto i : hit_idx) ann.contains_indices.push_back(i);
     }
 
-    // unevaluatedItems：对所有"尚未消费"的索引应用 schema
+    // unevaluatedItems: apply schema to all unevaluated indices
     if (unev_items_v) {
         auto is_evaluated = [&](std::size_t i)->bool {
             if (ann.all_items_seen) return true;
@@ -1100,7 +1061,7 @@ ValidationReport process_array_cluster(const JsonObject& schema_obj,
 }
 
 // -----------------------------------------------------------------------------
-// 对象簇协同处理
+// Object cluster joint processing
 // -----------------------------------------------------------------------------
 ValidationReport process_object_cluster(const JsonObject& schema_obj,
                                         const JsonValue& inst,
@@ -1225,11 +1186,11 @@ ValidationReport process_object_cluster(const JsonObject& schema_obj,
             Annotations sub_ann;
             auto r = eval_with_ann(sub, inst, ctx, sub_ann);
             if (!r.ok()) return r;
-            merge_ann(ann, sub_ann);   // dependentSchemas 贡献 annotation
+            merge_ann(ann, sub_ann);   // dependentSchemas contributes annotations
         }
     }
     if (unev_p_v) {
-        // 集合：已被本 schema cluster 或外层 ($ref / allOf / ...) 标记的属性
+        // set: properties marked by this cluster or outer ($ref / allOf / ...)
         auto is_evaluated = [&](std::string_view name)->bool {
             for (auto& p : ann.evaluated_props) if (p == name) return true;
             return false;
@@ -1260,7 +1221,7 @@ ValidationReport validate_slow_path(std::string_view json_instance,
         r.offset = static_cast<std::uint32_t>(parsed.error_offset);
         return r;
     }
-    // lazy 计算 validation vocabulary 状态（在所有 remote 都注入完后调到）。
+    // lazily compute validation vocabulary state (after all remotes injected).
     if (schema.disable_validation_vocab < 0) {
         schema.disable_validation_vocab = check_validation_vocab_disabled(schema) ? 1 : 0;
     }

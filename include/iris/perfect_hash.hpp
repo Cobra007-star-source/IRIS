@@ -1,23 +1,23 @@
 // =============================================================================
 // iris/perfect_hash.hpp
 //
-// AOT 完美哈希 (Phase 2)
+// AOT perfect hash (Phase 2)
 //
-// 思路（简化版 CHD / FCH）：
+// Approach (simplified CHD / FCH):
 //
-//   1. 选 N 个 key，全部已知（schema 编译期）
-//   2. 选 seed s，使一级哈希 h1(s, key) 将所有 key 桶冲突
-//      只发生在“可解决”的范围内
-//   3. 用很小的“位移表” disp[buckets] 把冲突再分摊到 N 个槽位
+//   1. Choose N keys, all known at schema compile time
+//   2. Choose seed s so primary hash h1(s, key) maps keys into buckets where
+//      collisions are only in a "solvable" range
+//   3. Use a small displacement table disp[buckets] to spread collisions into N slots
 //
-// 我们这版做了简单工程化裁剪：
+// This version is an engineering simplification:
 //
-//   - 没有走经典 CHD 的 bucket-排序-greedy，而是用“枚举 seed 的两步哈希”
-//     找到一个无冲突方案。对 N ≤ 256 这种 schema 字段量完全够用
-//   - 不存 key 本身，只存 (length, fnv64) 双重 fingerprint，在查询时验证，
-//     避免对外暴露 key 字符串内存
+//   - Instead of classic CHD bucket-sort-greedy, we enumerate seed two-step hashes
+//     to find a collision-free layout. Sufficient for N <= 256 schema fields
+//   - Keys are not stored; only (length, fnv64) dual fingerprints are kept and
+//     verified at lookup time, avoiding exposure of key string memory
 //
-// 查询路径在热点上是分支级数 1 的常数时间：mul/add/cmp。
+// Hot-path lookup is constant time with one branch: mul/add/cmp.
 // =============================================================================
 #pragma once
 
@@ -50,10 +50,10 @@ IRIS_FORCE_INLINE std::uint64_t fnv64(std::string_view s,
     return fnv64(s.data(), s.size(), seed);
 }
 
-// MurmurHash3 finalizer (fmix64)：
-//   FNV-1a 的低位扩散较弱，当 slot 数 N 较小时 `% N` 容易碰撞。
-//   把 FNV 结果再过一次 avalanche 函数，确保任何 1 bit 输入差异
-//   都能平均扩散到 64 bit 输出。这是 PerfectHash 的真实“槽位指纹”。
+// MurmurHash3 finalizer (fmix64):
+//   FNV-1a has weak low-bit diffusion; modulo N collides often for small N.
+//   Run FNV output through an avalanche function so any 1-bit input difference
+//   spreads across 64 output bits. This is the real "slot fingerprint" for PerfectHash.
 IRIS_FORCE_INLINE std::uint64_t fmix64(std::uint64_t k) noexcept {
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
@@ -68,25 +68,25 @@ IRIS_FORCE_INLINE std::uint64_t mixed_hash(std::string_view s,
     return fmix64(fnv64(s, seed));
 }
 
-// 构建后的查询表
+// Built lookup table
 struct PerfectHashTable {
-    // 槽位数 = key 数量（无空槽，密致表）
+    // Slot count = key count (no empty slots, dense table)
     std::uint32_t slot_count = 0;
-    // 一级 seed
+    // Primary seed
     std::uint64_t seed1 = 0;
-    // 二级 seed（用于冲突区间的解决）
+    // Secondary seed (resolves collision buckets)
     std::uint64_t seed2 = 0;
-    // 用于消重对比的指纹：每个槽 (length, fnv64)
+    // Fingerprints for dedup verification: each slot (length, fnv64)
     std::vector<std::uint32_t> slot_len;
     std::vector<std::uint64_t> slot_hash;
 
-    // 查询：返回 [0, slot_count) 槽位；若 key 不在集合中返回 -1。
+    // Lookup: returns slot in [0, slot_count); -1 if key not in set.
     [[nodiscard]] std::int32_t lookup(std::string_view key) const noexcept;
 };
 
-// 编译期表构建（暴露为运行时函数；后续 AOT 阶段可改成 constexpr）
+// Compile-time table build (runtime function today; may become constexpr in AOT phase)
 //
-// 不能保证总能构造成功；当 keys 过多或冲突严重时返回 success=false。
+// Not guaranteed to succeed; returns success=false when keys are too many or collisions severe.
 struct PerfectHashBuildResult {
     bool             success = false;
     PerfectHashTable table;

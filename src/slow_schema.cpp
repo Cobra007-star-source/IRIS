@@ -1,21 +1,6 @@
 // =============================================================================
-// src/slow_schema.cpp
-//
-// SlowSchema 构建器：
-//   1. 解析 schema JSON → JsonValue 树
-//   2. 沿 $id 栈遍历，给每个 subschema 注册 base URI + JSON Pointer / $anchor /
-//      $dynamicAnchor 命中点
-//   3. 预编译每个 "pattern" / patternProperties.key 为正则（含 \p{Letter} 之类
-//      Unicode 长名 → RE2 短名的预处理）
-//   4. 同时建好"node → base URI"映射，evaluation 期 0 拷贝 lookup
-//
-// 正则后端：build-time 选择
-//   * IRIS_HAVE_RE2 = 1 → 用 RE2（线性时间、ReDoS-safe）
-//   * 否则           → 用 std::regex（ECMAScript flavor，可能在 adversarial
-//                                     输入上出现 quadratic backtracking）
-//
-// 跨文档 $ref：通过 slow_schema_add_remote 注入远端文档；slow_eval 通过
-// resources 表按已解析的绝对 URI 直接查节点。
+// slow_schema.cpp
+// SlowSchema builder: index $id/$ref resources and precompile regex patterns
 // =============================================================================
 #include "iris/slow_schema.hpp"
 
@@ -33,7 +18,7 @@
 namespace iris {
 
 // -----------------------------------------------------------------------------
-// CompiledRegex：根据 build flag 切换具体引擎
+// CompiledRegex: engine selected at build time
 // -----------------------------------------------------------------------------
 struct CompiledRegex {
 #if defined(IRIS_HAVE_RE2)
@@ -76,7 +61,7 @@ SlowSchema& SlowSchema::operator=(SlowSchema&&) noexcept = default;
 namespace {
 
 // -----------------------------------------------------------------------------
-// JSON Pointer 工具
+// JSON Pointer utilities
 // -----------------------------------------------------------------------------
 std::string unescape_ptr(std::string_view tok) {
     std::string r;
@@ -132,7 +117,7 @@ const JsonValue* resolve_ptr(const JsonValue& root, std::string_view ptr) {
 }
 
 // -----------------------------------------------------------------------------
-// URI 工具
+// URI utilities
 // -----------------------------------------------------------------------------
 // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
 bool uri_has_scheme(std::string_view r) {
@@ -157,22 +142,22 @@ void split_uri(std::string_view uri, std::string& abs_part, std::string& frag) {
     }
 }
 
-// RFC 3986 §5.2.4 remove_dot_segments：把 ./ 和 ../ 规范化掉。
-// 输入是 path 部分（含或不含开头 '/'），返回规范化后字符串。
+// RFC 3986 §5.2.4 remove_dot_segments: normalize ./ and ../
+// Input is the path part (with or without leading '/'); returns normalized string.
 std::string remove_dot_segments(std::string_view input) {
     std::string out;
     out.reserve(input.size());
     std::size_t i = 0;
     while (i < input.size()) {
-        // "../" 或 "./" 在 input 开头：跳过
+        // skip "../" or "./" at start of input
         if (input.compare(i, 3, "../") == 0) { i += 3; continue; }
         if (input.compare(i, 2, "./")  == 0) { i += 2; continue; }
-        // "/./" → "/"，"/." 在末尾 → "/"
+        // "/./" → "/", "/." at end → "/"
         if (input.compare(i, 3, "/./") == 0) { i += 2; continue; }
         if (i + 2 == input.size() && input.compare(i, 2, "/.") == 0) {
             out.push_back('/'); i += 2; continue;
         }
-        // "/../" → "/"（同时弹出 out 的最后一个段）
+        // "/../" → "/" (also pop last segment from out)
         if (input.compare(i, 4, "/../") == 0) {
             auto p = out.rfind('/');
             if (p != std::string::npos) out.resize(p);
@@ -183,12 +168,12 @@ std::string remove_dot_segments(std::string_view input) {
             if (p != std::string::npos) out.resize(p);
             out.push_back('/'); i += 3; continue;
         }
-        // 单独 "." 或 ".."
+        // lone "." or ".."
         if ((input.size() - i == 1 && input[i] == '.') ||
             (input.size() - i == 2 && input.compare(i, 2, "..") == 0)) {
             i = input.size(); continue;
         }
-        // 拷贝一个 segment：从当前位置到下一个 '/'（不含下一个 '/'）
+        // copy one segment: from current position to next '/' (exclusive)
         std::size_t next_slash = input.find('/', i + 1);
         if (next_slash == std::string_view::npos) next_slash = input.size();
         out.append(input.data() + i, next_slash - i);
@@ -197,17 +182,17 @@ std::string remove_dot_segments(std::string_view input) {
     return out;
 }
 
-// 简化的 RFC 3986 reference resolution。覆盖 JSON Schema 测试集里的所有形态：
+// Simplified RFC 3986 reference resolution; covers all forms in the JSON Schema test suite:
 //   - ref = ""           → base
-//   - ref = "#frag"      → base 的非 fragment 部分 + "#frag"
-//   - ref = "/abs/path"  → base 的 scheme+authority + ref
-//   - ref = "scheme:..." → ref（绝对）
-//   - ref = "rel"        → base 路径最后一段被 ref 替换
-// 解析完毕后再走一次 remove_dot_segments 规范化。
+//   - ref = "#frag"      → non-fragment part of base + "#frag"
+//   - ref = "/abs/path"  → scheme+authority of base + ref
+//   - ref = "scheme:..." → ref (absolute)
+//   - ref = "rel"        → last segment of base path replaced by ref
+// After resolution, run remove_dot_segments once more.
 std::string uri_resolve(std::string_view base, std::string_view ref) {
     if (ref.empty()) return std::string(base);
 
-    // ref 以 '#' 开头：保留 base 的 abs 部分，换 fragment
+    // ref starts with '#': keep abs part of base, replace fragment
     if (ref[0] == '#') {
         auto h = base.find('#');
         std::string out(base.substr(0, h));
@@ -217,7 +202,7 @@ std::string uri_resolve(std::string_view base, std::string_view ref) {
 
     if (uri_has_scheme(ref)) return std::string(ref);
 
-    // 解析 base 的 scheme://authority + path
+    // parse scheme://authority + path from base
     std::string out;
     std::string_view base_nofrag = base;
     {
@@ -227,7 +212,7 @@ std::string uri_resolve(std::string_view base, std::string_view ref) {
 
     auto scheme_end = base_nofrag.find("://");
     std::string_view scheme_authority;   // "scheme://authority"
-    std::string_view base_path;          // 含前导 '/'
+    std::string_view base_path;          // includes leading '/'
     if (scheme_end != std::string_view::npos) {
         auto auth_start = scheme_end + 3;
         auto path_start = base_nofrag.find('/', auth_start);
@@ -239,19 +224,19 @@ std::string uri_resolve(std::string_view base, std::string_view ref) {
             base_path = base_nofrag.substr(path_start);
         }
     } else {
-        // base 没有 scheme：当作纯路径处理
+        // base has no scheme: treat as plain path
         scheme_authority = std::string_view{};
         base_path = base_nofrag;
     }
 
-    // 把 fragment 拆出去，规范化只作用在 path 部分
+    // strip fragment; normalization applies only to path
     std::string_view ref_nofrag = ref;
     std::string_view ref_frag;
     {
         auto h = ref.find('#');
         if (h != std::string_view::npos) {
             ref_nofrag = ref.substr(0, h);
-            ref_frag   = ref.substr(h);  // 含 '#'
+            ref_frag   = ref.substr(h);  // includes '#'
         }
     }
 
@@ -259,7 +244,7 @@ std::string uri_resolve(std::string_view base, std::string_view ref) {
     if (!ref_nofrag.empty() && ref_nofrag[0] == '/') {
         merged_path.assign(ref_nofrag);
     } else {
-        // 相对路径：移除 base_path 最后一段，再 append ref_nofrag
+        // relative path: drop last segment of base_path, then append ref_nofrag
         auto last_slash = base_path.rfind('/');
         if (last_slash == std::string_view::npos) last_slash = 0;
         merged_path.append(base_path.data(), last_slash + 1);
@@ -272,8 +257,8 @@ std::string uri_resolve(std::string_view base, std::string_view ref) {
     return out;
 }
 
-// URL-decode：把 "%25" / "%2F" 之类还原。JSON Schema $ref 字符串可能带 percent-
-// encoded 字符（典型场景：JSON Pointer 里含 '%'），需先 decode 再做 pointer 解析。
+// URL-decode: restore "%25" / "%2F" etc. JSON Schema $ref strings may be percent-
+// encoded (e.g. '%' in JSON Pointer); decode before pointer resolution.
 std::string url_decode(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -301,8 +286,8 @@ struct CompileError {
 };
 
 // -----------------------------------------------------------------------------
-// RE2 长名 Unicode 类预处理
-// JSON Schema 测试里出现 \p{Letter}，RE2 仅识别短名 \p{L}。我们做一次纯文本替换。
+// RE2 long-name Unicode class preprocessing
+// JSON Schema tests use \p{Letter}; RE2 only accepts short \p{L}. Plain-text replacement.
 // -----------------------------------------------------------------------------
 std::string preprocess_regex(std::string_view in) {
     // (long_name, short_name)
@@ -313,7 +298,7 @@ std::string preprocess_regex(std::string_view in) {
         {"Titlecase_Letter", "Lt"},
         {"Modifier_Letter", "Lm"},
         {"Other_Letter", "Lo"},
-        {"Cased_Letter", "L"},          // 近似
+        {"Cased_Letter", "L"},          // approximate
         {"Mark", "M"},
         {"Spacing_Mark", "Mc"},
         {"Nonspacing_Mark", "Mn"},
@@ -349,7 +334,7 @@ std::string preprocess_regex(std::string_view in) {
     std::string out;
     out.reserve(in.size());
     for (std::size_t i = 0; i < in.size(); ) {
-        // 探测 "\p{...}" 或 "\P{...}"
+        // detect "\p{...}" or "\P{...}"
         if (in[i] == '\\' && i + 2 < in.size() &&
             (in[i+1] == 'p' || in[i+1] == 'P') && in[i+2] == '{') {
             std::size_t end = in.find('}', i + 3);
@@ -416,7 +401,7 @@ void collect_patterns(const JsonValue& node,
 }
 
 // -----------------------------------------------------------------------------
-// 索引主体：沿 $id 栈走树，登记 resources & node_base
+// Indexing: walk tree along $id stack, register resources & node_base
 // -----------------------------------------------------------------------------
 void index_subschema(const JsonValue& node,
                      const std::string& base_uri,
@@ -429,28 +414,28 @@ void index_object_subschemas(const JsonValue& node,
                              SlowSchema& s) {
     const auto& obj = node.as_object();
 
-    // 1) 计算本节点的有效 base URI（看 $id；$id 可能是绝对或相对）。
+    // 1) Compute effective base URI for this node ($id may be absolute or relative).
     std::string my_base = base_uri;
     const JsonValue* id_v = node.find("$id");
     if (id_v && id_v->is_string()) {
         const std::string& id_str = id_v->as_string();
-        // 忽略带 fragment 的 $id（spec 不允许）
+        // ignore $id with fragment (not allowed by spec)
         if (id_str.find('#') == std::string::npos) {
             my_base = uri_resolve(base_uri, id_str);
         }
     }
 
-    // 2) 登记本节点到 resources 表的几种 key：
-    //    (a) JSON Pointer key（base + "#" + ptr）；ptr 空时即 "<base>#"
-    //    (b) base 自身（只对带 $id 的节点）→ "<my_base>"
+    // 2) Register this node in resources under several keys:
+    //    (a) JSON Pointer key (base + "#" + ptr); empty ptr => "<base>#"
+    //    (b) base itself (only nodes with $id) => "<my_base>"
     //    (c) anchor / dynamicAnchor → "<my_base>#<anchor>"
-    //    (d) 兼容旧版同文档 key（refs 表）：JSON Pointer / "anchor:..."
+    //    (d) legacy same-document keys (refs table): JSON Pointer / "anchor:..."
     {
         std::string key_ptr = base_uri;
         key_ptr.push_back('#');
         key_ptr.append(ptr_from_doc_root);
         if (!s.resources.count(key_ptr)) s.resources[key_ptr] = &node;
-        // 兼容旧 lookup："<#path>" 不带 base
+        // legacy lookup: "<#path>" without base
         if (base_uri.empty()) {
             std::string legacy = "#";
             legacy.append(ptr_from_doc_root);
@@ -459,9 +444,9 @@ void index_object_subschemas(const JsonValue& node,
         }
     }
     if (id_v && id_v->is_string()) {
-        // $id 注册整个 subschema 节点（带 fragment 形式 base#）
+        // $id registers whole subschema node (base# fragment form)
         if (!s.resources.count(my_base)) s.resources[my_base] = &node;
-        // 也允许 "<my_base>#" 命中
+        // also allow "<my_base>#" to match
         std::string with_hash = my_base + "#";
         if (!s.resources.count(with_hash)) s.resources[with_hash] = &node;
     }
@@ -472,22 +457,22 @@ void index_object_subschemas(const JsonValue& node,
             k1.push_back('#');
             k1.append(a);
             if (!s.resources.count(k1)) s.resources[k1] = &node;
-            // legacy 兼容
+            // legacy compatibility
             std::string lk = "anchor:";
             lk.append(a);
             if (!s.refs.count(lk)) s.refs[lk] = &node;
         }
     }
 
-    // 3) 记录该 subschema 的 base，用于后续 $ref 解析
+    // 3) Record base for this subschema (used by $ref resolution)
     s.node_base[&node] = my_base;
 
-    // 4) 递归子节点。注意：每个子键的 JSON Pointer = ptr_from_doc_root + "/" + escape(key)。
-    //    base 必须按"当前节点的 my_base"传下去；ptr 是当前文档内的 pointer：当本节点
-    //    自己拥有 $id 时，ptr 在新文档视角下重置；但同时 base_uri 改变了，所以查找时
-    //    "新 base + 新 ptr"和"旧 base + 旧 ptr"都能定位同一节点——我们两种 key 都登记。
+    // 4) Recurse children. Child JSON Pointer = ptr_from_doc_root + "/" + escape(key).
+    //    base follows current my_base; ptr is in-document. When this node
+    //    has $id, ptr resets in new document view; base_uri changes, so both
+    //    "new base + new ptr" and "old base + old ptr" locate the same node — register both.
     bool reset_ptr = (id_v && id_v->is_string());
-    std::string child_doc_root_ptr;     // 在当前 my_base 视角下的 ptr_from_doc_root
+    std::string child_doc_root_ptr;     // ptr_from_doc_root in current my_base view
     if (!reset_ptr) child_doc_root_ptr = ptr_from_doc_root;
 
     for (auto& [k, v] : obj) {
@@ -500,10 +485,10 @@ void index_object_subschemas(const JsonValue& node,
         child_ptr_new.push_back('/');
         child_ptr_new.append(esc);
 
-        // 先在 old base 视角下登记每个 child（为了旧的 "#/path" 兼容查找）
-        // 但只在 base_uri 与 my_base 不同（即本节点重设 $id）时；否则二者重合无需重复。
+        // register each child under old base (legacy "#/path" lookup)
+        // only when base_uri != my_base (this node reset $id); else redundant.
         if (reset_ptr && v.is_object()) {
-            // 用旧 base + 旧 ptr 也能查到同一节点
+            // same node reachable via old base + old ptr
             std::string key_old = base_uri;
             key_old.push_back('#');
             key_old.append(child_ptr_old);
@@ -532,24 +517,24 @@ void index_subschema(const JsonValue& node,
 }  // namespace
 
 // =============================================================================
-// 公开（slow_eval.cpp 通过 extern 调用）
+// Public API (called from slow_eval.cpp via extern)
 // =============================================================================
 
-// 解析 $ref：current_base 是发起点的有效 base URI（在 eval 中由 $id 栈维护）。
-// 1. 把 ref 按 RFC 3986 解析为绝对 URI（可能仍是 "#fragment" 形态）。
-// 2. 首先按完整 URI 查 resources。
-// 3. 没命中时按 "abs_part" 查 doc 根，再用 fragment（JSON Pointer / anchor）二级解析。
+// Resolve $ref: current_base is effective base URI at reference site ($id stack in eval).
+// 1. Resolve ref to absolute URI per RFC 3986 (may still be "#fragment" form).
+// 2. Look up resources by full URI first.
+// 3. On miss, look up doc root by abs_part, then resolve fragment (pointer / anchor).
 const JsonValue* slow_resolve_ref_uri(const SlowSchema& s,
                                       std::string_view current_base,
                                       std::string_view ref) {
     if (ref.empty()) return nullptr;
 
-    // 计算绝对 URI（可能含 fragment）
+    // compute absolute URI (may include fragment)
     std::string resolved = uri_resolve(current_base, ref);
 
-    // 1) 直接命中（完整 URI，包括 #anchor / #/pointer 形式）
+    // 1) direct hit (full URI, including #anchor / #/pointer)
     {
-        // URL-decode fragment 部分
+        // URL-decode fragment portion
         auto h = resolved.find('#');
         std::string lookup = resolved;
         if (h != std::string::npos) {
@@ -565,7 +550,7 @@ const JsonValue* slow_resolve_ref_uri(const SlowSchema& s,
         }
     }
 
-    // 2) 拆 abs + frag，再 base-only 查 doc 根，frag 走 JSON Pointer
+    // 2) split abs + frag, base-only doc lookup, fragment via JSON Pointer
     std::string abs_part, frag;
     split_uri(resolved, abs_part, frag);
 
@@ -583,7 +568,7 @@ const JsonValue* slow_resolve_ref_uri(const SlowSchema& s,
     if (!decoded.empty() && decoded[0] == '/') {
         return resolve_ptr(*doc, decoded);
     }
-    // 是 anchor 形式：组装 "<abs_part>#<anchor>" 再查一次
+    // anchor form: assemble "<abs_part>#<anchor>" and look up again
     std::string anchor_key = abs_part;
     anchor_key.push_back('#');
     anchor_key.append(decoded);
@@ -592,12 +577,12 @@ const JsonValue* slow_resolve_ref_uri(const SlowSchema& s,
     return nullptr;
 }
 
-// 兼容旧 API（slow_eval.cpp 早期版本调用）。
+// Legacy API (early slow_eval.cpp).
 const JsonValue* slow_resolve_ref_impl(const SlowSchema& s, std::string_view ref) {
     return slow_resolve_ref_uri(s, s.primary_base, ref);
 }
 
-// 暴露 base 查询：slow_eval 拿到一个 subschema 节点 pointer 后，查它的有效 base URI。
+// Expose base lookup: given subschema node pointer, return effective base URI.
 const std::string* slow_node_base(const SlowSchema& s, const JsonValue* node) noexcept {
     auto it = s.node_base.find(node);
     if (it == s.node_base.end()) return nullptr;
@@ -643,12 +628,12 @@ bool slow_regex_match_inline(std::string_view pattern, std::string_view text) no
 }
 
 // =============================================================================
-// 公开 API：编译 + 远端注入
+// Public API: compile + remote document injection
 // =============================================================================
-// 预注册 JSON Schema 官方 metaschema URI（含其分词汇 sub-schema），让指向它们的
-// $ref 始终通过。metaschema 用于校验 schema 本身的合法性；对于"validator
-// validate instance"的常规调用而言，引用 metaschema 等同于 `true` schema。
-// 用一个全局静态 sentinel 节点，所有 metaschema URI 都映射到它。
+// Pre-register official JSON Schema metaschema URIs (and vocabulary sub-schemas) so
+// $ref to them always pass. Metaschema validates schemas; for instance validation,
+// referencing metaschema is equivalent to a `true` schema.
+// Single static sentinel node; all metaschema URIs map to it.
 const JsonValue& metaschema_sentinel() {
     static JsonValue v = JsonValue::make_bool(true);
     return v;
@@ -666,7 +651,7 @@ void preregister_metaschemas(SlowSchema& s) {
         "https://json-schema.org/draft/2020-12/meta/format-assertion",
         "https://json-schema.org/draft/2020-12/meta/content",
         "https://json-schema.org/draft/2020-12/meta/unevaluated",
-        // 2019-09（保险起见）
+        // 2019-09 (for safety)
         "https://json-schema.org/draft/2019-09/schema",
         "https://json-schema.org/draft/2019-09/meta/core",
         "https://json-schema.org/draft/2019-09/meta/applicator",
@@ -674,7 +659,7 @@ void preregister_metaschemas(SlowSchema& s) {
         "https://json-schema.org/draft/2019-09/meta/meta-data",
         "https://json-schema.org/draft/2019-09/meta/format",
         "https://json-schema.org/draft/2019-09/meta/content",
-        // 旧版
+        // older drafts
         "http://json-schema.org/draft-07/schema#",
         "http://json-schema.org/draft-07/schema",
         "http://json-schema.org/draft-06/schema#",
@@ -696,7 +681,7 @@ SlowSchemaBuildResult compile_slow_schema(std::string_view schema_json) {
     auto schema = std::make_unique<SlowSchema>();
     schema->root = std::move(parsed.value);
 
-    // 主文档 base：取 root.$id（如果存在且无 fragment）
+    // Primary document base: root.$id if present and has no fragment
     if (schema->root.is_object()) {
         if (const JsonValue* id_v = schema->root.find("$id")) {
             if (id_v->is_string() && id_v->as_string().find('#') == std::string::npos) {
@@ -728,21 +713,21 @@ bool slow_schema_add_remote(SlowSchema& s, std::string uri, std::string_view jso
     auto root_holder = std::make_unique<JsonValue>(std::move(parsed.value));
     JsonValue* root_ptr = root_holder.get();
 
-    // 远端文档自身 $id 可能覆盖外部 uri，spec 上以 $id 为准；但为保险起见
-    // 我们用调用方传入的 uri 作为 base（更稳，因为外面就是按它注册的）。
+    // Remote doc $id may differ from caller uri; spec prefers $id; for safety
+    // we use caller-supplied uri as base (stable: registered that way externally).
     std::string base = std::move(uri);
     if (root_ptr->is_object()) {
         if (const JsonValue* id_v = root_ptr->find("$id")) {
             if (id_v->is_string() &&
                 id_v->as_string().find('#') == std::string::npos) {
-                // 注：仍以传入 uri 为主键，但 $id 的 uri 也额外登记一份别名
+                // note: caller uri remains primary key; $id uri also registered as alias
                 if (!s.resources.count(id_v->as_string()))
                     s.resources[id_v->as_string()] = root_ptr;
             }
         }
     }
 
-    // 登记 root 自己
+    // register root itself
     s.resources[base] = root_ptr;
     s.resources[base + "#"] = root_ptr;
 
@@ -751,7 +736,7 @@ bool slow_schema_add_remote(SlowSchema& s, std::string uri, std::string_view jso
     try {
         collect_patterns(*root_ptr, s.regex_cache);
     } catch (...) {
-        // 远端文档里有 invalid regex：忽略，主流程仍可继续
+        // invalid regex in remote doc: ignore; main flow continues
     }
 
     s.remote_roots.push_back(std::move(root_holder));

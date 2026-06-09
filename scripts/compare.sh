@@ -2,17 +2,17 @@
 # =============================================================================
 # scripts/compare.sh
 #
-# 端到端横向对比脚本（IRIS Phase 4 交付）：
-#   1. Release build IRIS（-O3 + 平台原生 SIMD + LTO）
-#   2. 生成扁平 + 嵌套两套 1M 条 JSON 语料
-#   3. 跑 IRIS Fast Path（扁平 / 嵌套）
-#   4. 跑 simdjson 纯解析 baseline（扁平 / 嵌套）
-#   5. 跑 ajv (Node.js) 业内基准
-#   6. 输出对齐表 + ASCII bar chart
+# End-to-end horizontal comparison script (IRIS Phase 4 deliverable):
+#   1. Release build IRIS (-O3 + native SIMD + LTO)
+#   2. Generate flat + nested 1M-record JSON corpora
+#   3. Run IRIS Fast Path (flat / nested)
+#   4. Run simdjson pure-parse baseline (flat / nested)
+#   5. Run ajv (Node.js) industry reference
+#   6. Print aligned table + ASCII bar chart
 #
-# 用法：
-#   ./scripts/compare.sh                # 1M 条，3 轮
-#   ./scripts/compare.sh 500000 5       # 50W 条，5 轮
+# Usage:
+#   ./scripts/compare.sh                # 1M records, 3 iterations
+#   ./scripts/compare.sh 500000 5       # 500K records, 5 iterations
 # =============================================================================
 set -euo pipefail
 

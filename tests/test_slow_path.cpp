@@ -1,8 +1,8 @@
 // =============================================================================
 // tests/test_slow_path.cpp
 //
-// 慢车道单元测试：直接用 SlowSchema + validate_slow_path 验证关键关键字。
-// 覆盖：allOf / anyOf / oneOf / not / if-then-else / $ref / const / enum /
+// Slow path unit tests via SlowSchema + validate_slow_path.
+// Covers: allOf / anyOf / oneOf / not / if-then-else / $ref / const / enum /
 //       multipleOf / pattern / dependentRequired / unevaluatedProperties.
 // =============================================================================
 #include "iris/slow_schema.hpp"
@@ -46,7 +46,7 @@ IRIS_TEST(slow_allOf_short_circuit) {
 
 IRIS_TEST(slow_oneOf_must_be_one) {
     const char* s = R"({"oneOf":[{"type":"integer"},{"minimum":5}]})";
-    // 9 matches both (integer AND minimum:5) → oneOf 失败
+    // 9 matches both (integer AND minimum:5) → oneOf fails
     IRIS_EXPECT(fail_validate(s, "9"));
     // -3 matches only integer
     IRIS_EXPECT(ok_validate(s, "-3"));
@@ -101,9 +101,9 @@ IRIS_TEST(slow_unevaluated_props) {
 }
 
 IRIS_TEST(slow_multipleOf_overflow_safe) {
-    // -ffast-math 关闭对 slow_eval.cpp 不生效 → isfinite() 应工作
+    // -ffast-math off for slow_eval.cpp → isfinite() should work
     const char* s = R"({"type":"integer","multipleOf":0.123456789})";
-    IRIS_EXPECT(fail_validate(s, "1e308"));   // 商溢出为 inf
+    IRIS_EXPECT(fail_validate(s, "1e308"));   // quotient overflows to inf
 }
 
 IRIS_TEST(validator_routing_fast_when_simple) {
@@ -130,15 +130,15 @@ IRIS_TEST(validator_routing_slow_when_allOf) {
 
 #if IRIS_ENABLE_JIT
 IRIS_TEST(jit_compiler_api_demo_spill_works) {
-    // Compiler API 在 ARM64(31 GP) / x86_64(16 GP) 上对 32 个虚拟寄存器
-    // 必然触发栈溢出 + reload。这个测试只要 JIT 生成成功并能跑就算过。
+    // Compiler API on ARM64(31 GP)/x86_64(16 GP) with 32 virtual regs
+    // must spill + reload. Pass if JIT compiles and runs.
     auto fn = iris::jit::jit_compile_compiler_demo();
     IRIS_EXPECT(fn != nullptr);
     if (fn) {
         std::uint64_t out1 = fn(0xDEAD'BEEFULL);
         std::uint64_t out2 = fn(0xDEAD'BEEFULL);
-        IRIS_EXPECT_EQ(out1, out2);  // 确定性
-        IRIS_EXPECT(out1 != 0);      // 链尾累加非零
+        IRIS_EXPECT_EQ(out1, out2);  // deterministic
+        IRIS_EXPECT(out1 != 0);      // chain sum non-zero
     }
 }
 #endif

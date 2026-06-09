@@ -1,7 +1,7 @@
 # IRIS Gateway — Milestone Report (Network-First Beachhead)
 
 Status of the TechEmpower gateway built on top of the IRIS SIMD / zero-allocation
-kernel. Cadence follows the "全生命周期铁血质量验证与极限跑分对抗" handbook:
+kernel. Cadence follows the full-lifecycle quality-gate and benchmark handbook:
 every milestone reports **what shipped**, **how it was verified**, and **what
 the next measurement must prove**.
 

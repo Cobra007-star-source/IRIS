@@ -1,10 +1,10 @@
 // =============================================================================
 // bench/ajv_bench.mjs
 //
-// 与 iris_validate 完全对称的参考实现，使用 ajv —— ebdrup/json-schema-benchmark
-// 长期榜首选手。
+// Mirror of iris_validate using ajv (ebdrup/json-schema-benchmark leader)
+// Long-time json-schema-benchmark leader.
 //
-// 用法：
+// Usage:
 //   node bench/ajv_bench.mjs <schema.json> <data.jsonl> [iterations=1]
 // =============================================================================
 import fs from "node:fs";
@@ -33,8 +33,8 @@ const lines = raw.split("\n").filter(l => l.length > 0);
 
 console.log(`[ajv]  schema=${schemaPath} lines=${lines.length} iters=${iters}`);
 
-// ajv 处理的是已 parse 的 JS 对象。为公平对比 IRIS（含 parse），
-// 我们把 JSON.parse 算进去——这是工业现场实际成本。
+// ajv validates parsed JS objects. For fair compare with IRIS (includes parse),
+// we include JSON.parse — real production cost.
 let ok = 0;
 const t0 = process.hrtime.bigint();
 for (let it = 0; it < iters; ++it) {

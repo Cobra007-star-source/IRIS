@@ -1,11 +1,6 @@
 // =============================================================================
-// src/inspector.cpp  (Phase 4 骨架)
-//
-// 实现：迭代式 Tarjan 强连通分量算法。
-//
-// 一旦发现任一 SCC 大小 > 1，或存在自环，即判定为 $ref 环路 → 强制慢车道。
-//
-// 这里只做引用图拓扑，对 unevaluatedProperties / 复杂 pattern 用布尔短路接管。
+// inspector.cpp
+// Iterative Tarjan SCC on $ref graph; cycles force slow path (Phase 4 skeleton)
 // =============================================================================
 #include "iris/inspector.hpp"
 
@@ -28,7 +23,7 @@ struct TarjanState {
 
 void tarjan_strongconnect(const std::vector<std::vector<std::uint32_t>>& g,
                           TarjanState& st, std::uint32_t v) {
-    // 迭代版：(v, child_index)
+    // iterative version: (v, child_index)
     struct Frame { std::uint32_t v; std::size_t i; };
     std::stack<Frame> work;
 
@@ -86,7 +81,7 @@ InspectionResult inspect(const SchemaInspectionInput& input) noexcept {
     st.lowlink.assign(n, -1);
     st.on_stack.assign(n, false);
 
-    // 自环立即判出
+    // self-loop detected immediately
     for (std::size_t i = 0; i < n; ++i) {
         for (auto t : input.ref_graph[i]) {
             if (t == static_cast<std::uint32_t>(i)) {

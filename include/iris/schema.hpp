@@ -1,17 +1,17 @@
 // =============================================================================
 // iris/schema.hpp
 //
-// 编译期 / 加载期得到的 Schema 描述符。
+// Compile-time / load-time schema descriptor.
 //
-// 一切都是 SoA、POD、可拷贝复制：
+// Everything is SoA, POD, copyable:
 //
-//   types[i]          : 该字段允许的类型掩码 (bitwise DFA 的 Expected Mask)
-//   required_mask     : 必填位掩码（bit i 表示 slot i 必填）
-//   max_string_len[i] : 字符串字段的长度上限（0 = 无）
-//   min_int[i]/max_int[i] : 整数字段的边界
+//   types[i]          : allowed type mask for field i (bitwise DFA expected mask)
+//   required_mask     : required-field bit mask (bit i means slot i required)
+//   max_string_len[i] : max string length (0 = none)
+//   min_int[i]/max_int[i] : integer bounds
 //
-// Schema 越简单，bitwise DFA 越紧。复杂 schema 由 Inspector 在加载期拦截，
-// 直接进入慢车道。
+// Simpler schemas yield tighter bitwise DFAs. Complex schemas are blocked by
+// Inspector at load time and routed to the slow path.
 // =============================================================================
 #pragma once
 
@@ -27,9 +27,9 @@
 
 namespace iris {
 
-struct CompiledSchema;  // 前向：因为 CompiledSchema 自递归引用
+struct CompiledSchema;  // forward: CompiledSchema is self-recursive
 
-// 类型掩码：低 8 位与 TokenKind 对齐
+// Type mask: low 8 bits align with TokenKind
 enum TypeBit : std::uint8_t {
     kTypeNone    = 0,
     kTypeObject  = 1u << 0,
@@ -54,17 +54,15 @@ using TypeMask = std::uint8_t;
     return kTypeNone;
 }
 
-// "短键直查表"
+// Short-key direct lookup table
 //
-// 当 schema 所有字段名长度 ≤ 8 字节时（绝大多数实际 schema 满足），
-// 完美哈希被替换为更直接的方案：
-//   - 把每个字段名打包为 1 个 uint64_t (little-endian, 高位补 0)
-//   - 查询时一次 8 字节 unaligned load + 长度掩码 + 线性比较
+// When all schema field names are <= 8 bytes (most real schemas):
+//   - Pack each name into one uint64_t (little-endian, zero-pad high bits)
+//   - Lookup: one 8-byte unaligned load + length mask + linear compare
 //
-// 这条快路径每个 key 节省 ~30 cycles (fmix64 + mod)。
+// Saves ~30 cycles per key vs fmix64 + mod.
 //
-// 调用前必须保证 (key_ptr + 8) 仍在合法可读范围内——
-// iris_validate 中通过追加 16 字节零填充满足。
+// Caller must ensure (key_ptr + 8) is readable — iris_validate appends 16 zero bytes.
 struct ShortKeyTable {
     static constexpr std::size_t kMaxKeys = 16;
     std::uint64_t bits[kMaxKeys] = {};
@@ -73,27 +71,27 @@ struct ShortKeyTable {
     std::uint8_t  count = 0;
 };
 
-// CompiledSchema 的"根类型"：决定 validate() 入口怎么 dispatch
+// Root type of CompiledSchema: determines validate() entry dispatch
 enum class SchemaKind : std::uint8_t {
-    kAlwaysValid   = 0,   // schema == true 或 {}
+    kAlwaysValid   = 0,   // schema == true or {}
     kAlwaysInvalid = 1,   // schema == false
-    kObjectRoot    = 2,   // 顶层 type=object，递归走 validate_object
-    kValueRoot     = 3,   // 顶层 type 为 string/number/integer/array/bool/null
+    kObjectRoot    = 2,   // top-level type=object, recursive validate_object
+    kValueRoot     = 3,   // top-level string/number/integer/array/bool/null
 };
 
-// 编译产物：递归 object/array schema。
+// Compiled artifact: recursive object/array schema.
 //
-// SchemaKind 决定 root 行为；
-// 对 kObjectRoot：types[i] 是第 i 个 property 的允许类型 mask；
-// 对 kValueRoot ：只用 slot 0 存 root 的 type+constraints（视为合成"单值"slot）；
-// 对 kAlways*   ：全字段为空，validate 直接返回。
+// SchemaKind controls root behavior;
+// for kObjectRoot: types[i] is allowed type mask for property i;
+// for kValueRoot: only slot 0 stores root type+constraints (synthetic single-value slot);
+// for kAlways*: all fields empty, validate returns immediately.
 //
-// 嵌套字段：
-//   - 字段 type 包含 object → nested_object[slot] 持有子 schema
-//   - 字段 type 包含 array  → array_item_type[slot] 是 item 的 TypeMask；
-//                              若 item 还是 object，则 array_item_nested[slot] 进一步递归
+// Nested fields:
+//   - field type includes object -> nested_object[slot] holds child schema
+//   - field type includes array  -> array_item_type[slot] is item TypeMask;
+//                                   if item is object, array_item_nested[slot] recurses
 //
-// 三个并行 vector 维持 SoA 风格；非嵌套字段的对应槽位用空指针 / kTypeNone 占位。
+// Three parallel vectors maintain SoA style; non-nested slots use nullptr / kTypeNone.
 struct CompiledSchema {
     SchemaKind                 kind = SchemaKind::kObjectRoot;
     PerfectHashTable           field_index;
@@ -103,9 +101,9 @@ struct CompiledSchema {
     std::vector<std::uint32_t> max_string_len;
     std::vector<std::int64_t>  min_int;
     std::vector<std::int64_t>  max_int;
-    // 浮点最小/最大：与 min_int/max_int 并行，仅在 number 字段需要时启用。
-    // 默认 -DBL_MAX / +DBL_MAX 表达"无约束"；不用 infinity() 因为 -ffast-math 会把
-    // numeric_limits::infinity() 折成 0（fast-math 假定 finite-math-only）。
+    // Float min/max parallel to min_int/max_int; enabled for number fields only.
+    // Default -DBL_MAX / +DBL_MAX means unconstrained; avoid infinity() because -ffast-math
+    // folds numeric_limits::infinity() to 0 (assumes finite-math-only).
     std::vector<double>        min_dbl;
     std::vector<double>        max_dbl;
     std::vector<std::string>   field_names;
@@ -118,7 +116,7 @@ struct CompiledSchema {
     [[nodiscard]] std::size_t field_count() const noexcept { return types.size(); }
 };
 
-// 受限 Schema 字段描述符，供 DSL 使用（不含嵌套；嵌套请走 compile_schema_from_json）
+// Restricted schema field descriptor for DSL (no nesting; use compile_schema_from_json)
 struct FieldSpec {
     std::string_view name;
     TypeMask         type           = kTypeNone;
@@ -129,8 +127,8 @@ struct FieldSpec {
     std::int64_t     max_int        = INT64_MAX;
 };
 
-// 用 FieldSpec 数组直接构造 CompiledSchema 的便利函数。
-// 失败时 ok=false，diagnostic 给出原因（例如完美哈希构造不出来）。
+// Convenience: build CompiledSchema from FieldSpec array.
+// On failure ok=false, diagnostic explains (e.g. perfect hash construction failed).
 struct SchemaBuildResult {
     bool             ok = false;
     CompiledSchema   schema;
@@ -140,16 +138,16 @@ struct SchemaBuildResult {
 SchemaBuildResult compile_schema(std::span<const FieldSpec> fields,
                                  bool additional_properties = false);
 
-// 直接从 JSON Schema 文档（即一段 schema.json 的文本）编译。
+// Compile directly from JSON Schema document text.
 //
-// 目前覆盖 draft-2020-12 的核心子集：
-//   - type: 单类型 / 类型数组
+// Currently covers draft-2020-12 core subset:
+//   - type: single / array
 //   - properties / required / additionalProperties
 //   - minimum / maximum (integer)
 //   - minLength / maxLength
 //
-// 不支持的关键字（pattern / $ref / allOf 等）会被 Inspector 投否决票
-// 后续由慢车道接手；当前 stub 实现是直接拒绝。
+// Unsupported keywords (pattern / $ref / allOf etc.) are vetoed by Inspector
+// for slow path; current stub rejects outright.
 SchemaBuildResult compile_schema_from_json(std::string_view schema_json);
 
 }  // namespace iris

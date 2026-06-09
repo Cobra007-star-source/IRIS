@@ -1,15 +1,6 @@
 // =============================================================================
-// src/simd_ops.cpp
-//
-// SIMD 字节原语实现。
-//
-// 设计要点：
-//   - "凌空扫描"：直接在用户输入 buffer 上工作，全程不分配
-//   - 单循环主体使用 16 字节 NEON 或 32 字节 AVX2 块
-//   - 头尾未对齐字节通过相同的标量 fallback 处理，保证算法对所有
-//     长度输入都给出和 scalar 完全一致的结果
-//
-// 这层是后续 Fused Parse&Validate 引擎的“凿岩机”。
+// simd_ops.cpp
+// SIMD byte primitives for zero-allocation scanning over user buffers
 // =============================================================================
 #include "iris/simd_ops.hpp"
 
@@ -26,7 +17,7 @@
 namespace iris::simd {
 
 // -----------------------------------------------------------------------------
-// 实现名
+// implementation name
 // -----------------------------------------------------------------------------
 const char* implementation_name() noexcept {
 #if defined(IRIS_HAS_AVX2)
@@ -39,14 +30,14 @@ const char* implementation_name() noexcept {
 }
 
 // -----------------------------------------------------------------------------
-// 标量参考实现
+// scalar reference implementation
 // -----------------------------------------------------------------------------
 std::size_t count_byte_scalar(const std::uint8_t* IRIS_RESTRICT data,
                               std::size_t size,
                               std::uint8_t needle) noexcept {
     std::size_t n = 0;
     for (std::size_t i = 0; i < size; ++i) {
-        n += (data[i] == needle);  // 无分支累加：让编译器自动生成 cmov
+        n += (data[i] == needle);  // branchless add; compiler emits cmov
     }
     return n;
 }
@@ -75,9 +66,9 @@ std::size_t find_byte_pair_scalar(const std::uint8_t* IRIS_RESTRICT data,
 // -----------------------------------------------------------------------------
 #if defined(IRIS_HAS_NEON)
 
-// 单循环：每 64 字节累加一次到 16x u8 lane 累加器。
-// u8 lane 最大值是 255，所以每 255 个 16 字节块必须把 u8 累加器
-// 横向归约到 u32，否则会溢出。
+// Single loop: accumulate 64 bytes per flush into 16x u8 lanes.
+// u8 lane max 255; every 255 x 16-byte blocks flush u8 accumulator
+// to u32 or overflow.
 static std::size_t count_byte_neon(const std::uint8_t* data,
                                    std::size_t size,
                                    std::uint8_t needle) noexcept {
@@ -86,7 +77,7 @@ static std::size_t count_byte_neon(const std::uint8_t* data,
     std::size_t i = 0;
 
     constexpr std::size_t kBlock = 16;
-    constexpr std::size_t kFlush = kBlock * 255;  // 防 u8 累加器溢出
+    constexpr std::size_t kFlush = kBlock * 255;  // prevent u8 accumulator overflow
 
     while (i + kFlush <= size) {
         uint8x16_t acc = vdupq_n_u8(0);
@@ -124,7 +115,7 @@ static std::size_t find_byte_neon(const std::uint8_t* data,
     while (i + kBlock <= size) {
         uint8x16_t v   = vld1q_u8(data + i);
         uint8x16_t cmp = vceqq_u8(v, v_needle);
-        // 将每个 lane 折叠到 64 位掩码：将 u8 0xFF 映射为 nibble 0xF
+        // fold lanes to 64-bit mask: map u8 0xFF to nibble 0xF
         uint8x8_t  narrowed = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
         std::uint64_t mask  = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
         if (IRIS_UNLIKELY(mask != 0)) {
@@ -253,7 +244,7 @@ static std::size_t find_byte_pair_avx2(const std::uint8_t* data,
 #endif  // IRIS_HAS_AVX2
 
 // -----------------------------------------------------------------------------
-// 公共 dispatch
+// public dispatch
 // -----------------------------------------------------------------------------
 std::size_t count_byte(const std::uint8_t* IRIS_RESTRICT data,
                        std::size_t size,
@@ -297,9 +288,9 @@ std::size_t find_byte_pair(const std::uint8_t* IRIS_RESTRICT data,
 // -----------------------------------------------------------------------------
 // JSON whitespace skipping
 //
-// JSON 仅认四种空白：' '(0x20) '\t'(0x09) '\n'(0x0A) '\r'(0x0D)
-// 我们用纯位运算的 lookup 思路：把 4 个目标字节做 OR-tree 比较，
-// 全部满足才记 0xFF，否则 0x00。
+// JSON whitespace: space/tab/LF/CR only
+// Bitwise OR-tree compare against four target bytes;
+// all match => 0xFF per byte, else 0x00.
 // -----------------------------------------------------------------------------
 std::size_t skip_json_whitespace_full(const std::uint8_t* data, std::size_t size) noexcept {
     std::size_t i = 0;
@@ -315,7 +306,7 @@ std::size_t skip_json_whitespace_full(const std::uint8_t* data, std::size_t size
         uint8x16_t is_ws =
             vorrq_u8(vorrq_u8(vceqq_u8(v, v_sp), vceqq_u8(v, v_tab)),
                      vorrq_u8(vceqq_u8(v, v_nl), vceqq_u8(v, v_cr)));
-        // 取反：非空白处变成 0xFF
+        // invert: non-whitespace becomes 0xFF
         uint8x16_t non_ws = vmvnq_u8(is_ws);
         uint8x8_t  narrowed = vshrn_n_u16(vreinterpretq_u16_u8(non_ws), 4);
         std::uint64_t mask  = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);

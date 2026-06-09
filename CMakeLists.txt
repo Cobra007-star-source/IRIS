@@ -21,9 +21,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Global sanitizer selector (defined early so the LTO guard below can see it).
 set(IRIS_SANITIZER "" CACHE STRING "Global sanitizer: '' | address | thread | undefined")
 
-# 开启 LTO 让 simd_ops / parser / validator 跨 TU 内联。
-# Phase 1 已确认 NEON 单循环吞吐 33 GB/s；FastPath 校验吞吐瓶颈在
-# 函数调用边界（无法跨 TU 内联）。LTO 一刀切掉这层。
+# Enable LTO so simd_ops / parser / validator inline across translation units.
+# Phase 1 confirmed NEON single-loop throughput at 33 GB/s; Fast Path validation
+# throughput is bottlenecked at function-call boundaries (no cross-TU inlining). LTO removes that layer.
 if(NOT DEFINED IRIS_ENABLE_LTO)
     set(IRIS_ENABLE_LTO ON)
 endif()
@@ -96,8 +96,8 @@ target_include_directories(iris PUBLIC
 target_compile_options(iris PRIVATE ${IRIS_ARCH_FLAGS})
 target_compile_features(iris PUBLIC cxx_std_20)
 
-# 慢车道走 IEEE-754 严格语义：multipleOf 的溢出检测依赖 isfinite()，被
-# -ffast-math 假设掉就会出错。慢车道不在 hot path 上，安全比 perf 重要。
+# Slow path uses strict IEEE-754 semantics: multipleOf overflow detection relies on
+# isfinite(), which -ffast-math can break. Slow path is off the hot path; correctness beats perf.
 set_source_files_properties(src/slow_eval.cpp src/slow_schema.cpp
     PROPERTIES
     COMPILE_OPTIONS "-fno-fast-math;-fno-finite-math-only")
@@ -118,7 +118,7 @@ if(IRIS_BUILD_SIMDJSON OR IRIS_ENABLE_JIT OR IRIS_BUILD_GATEWAY)
 endif()
 
 if(IRIS_BUILD_SIMDJSON)
-    # simdjson 是纯解析 baseline。FetchContent 拉，关闭可用 -DIRIS_BUILD_SIMDJSON=OFF。
+    # simdjson is a pure-parse baseline. Fetched via FetchContent; disable with -DIRIS_BUILD_SIMDJSON=OFF.
     FetchContent_Declare(
         simdjson
         GIT_REPOSITORY https://github.com/simdjson/simdjson.git
@@ -132,7 +132,7 @@ if(IRIS_BUILD_SIMDJSON)
 endif()
 
 if(IRIS_ENABLE_JIT)
-    # asmjit：仅在 -DIRIS_ENABLE_JIT=ON 时拉取
+    # asmjit: fetched only when -DIRIS_ENABLE_JIT=ON
     FetchContent_Declare(
         asmjit
         GIT_REPOSITORY https://github.com/asmjit/asmjit.git
@@ -146,9 +146,9 @@ if(IRIS_ENABLE_JIT)
 endif()
 
 # -----------------------------------------------------------------------------
-# RE2: 慢车道的正则引擎。优先用系统安装（brew install re2 / apt install libre2-dev），
-# 没装时退到 std::regex。RE2 是线性时间、ReDoS-safe；std::regex 在 Apple Clang
-# 下 backtracking、可能在 adversarial pattern 上慢到不可接受。
+# RE2: regex engine for the slow path. Prefer system install (brew install re2 / apt install libre2-dev);
+# fall back to std::regex if missing. RE2 is linear-time and ReDoS-safe; std::regex on Apple Clang
+# uses backtracking and can be unacceptably slow on adversarial patterns.
 # -----------------------------------------------------------------------------
 find_package(re2 QUIET)
 if(re2_FOUND)

@@ -1,15 +1,15 @@
 // =============================================================================
 // bench/simdjson_bench.cpp
 //
-// 用 simdjson 作 baseline，跑相同语料的"纯解析"吞吐。
+// simdjson baseline: parse-only throughput on same corpus.
 //
-// simdjson 只做 JSON 解析（On-Demand），不做 schema 校验，所以这个数字
-// 应当理解为：
-//   - IRIS Fast Path 校验 = simdjson 解析 + 1×（理想极限）
-//   - 实际现状 IRIS < simdjson（因为它做了额外的校验）
-//   - 比值 simdjson/IRIS 反映了"IRIS 把校验隐藏进单遍扫描的代价"
+// simdjson parses only (on-demand), no schema validation;
+// interpret as:
+//   - IRIS fast path validate = simdjson parse + 1× (ideal bound)
+//   - today IRIS < simdjson (extra validation work)
+//   - simdjson/IRIS ratio reflects cost of fused parse+validate
 //
-// 用法：
+// Usage:
 //   simdjson_bench <data.jsonl> [iterations=1]
 // =============================================================================
 #include <chrono>
@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     int iters = (argc > 2) ? std::atoi(argv[2]) : 1;
     if (iters < 1) iters = 1;
 
-    // 分行预处理（与 iris_validate / ajv 对齐）
+    // line split preprocessing (aligned with iris_validate / ajv)
     std::vector<std::string_view> lines;
     {
         const char* p = data.data();
@@ -64,11 +64,11 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < iters; ++it) {
         for (auto sv : lines) {
-            // simdjson 要求 padded_string 或 padded_string_view。
+            // simdjson requires padded_string or padded_string_view.
             simdjson::padded_string padded(sv.data(), sv.size());
             auto doc = parser.iterate(padded);
             if (doc.error()) continue;
-            // 触发实际 token 解析：遍历一遍对象顶层 key
+            // trigger parse: walk top-level object keys
             for ([[maybe_unused]] auto field : doc.get_object()) {}
             ++ok_count;
         }

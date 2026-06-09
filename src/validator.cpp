@@ -1,16 +1,6 @@
 // =============================================================================
-// src/validator.cpp
-//
-// 双引擎路由：
-//   * Validator(CompiledSchema)              — 直接走 Fast Path（含可选 JIT）
-//   * Validator::from_schema_json(text, out) — 自动选路：
-//       (a) 先 compile_schema_from_json → Fast Path
-//       (b) 失败再 compile_slow_schema   → Slow Path（AST 解释器）
-//       (c) 还失败 → ValidatorBuild.ok = false
-//
-// 数据共享：两条路径都对原始 json 字节流做 zero-copy（fast 直接 SIMD 扫，slow
-// 经 JsonReader 解析为 JsonValue 树。后者必须 parse 因为它需要 tree-shape 访问，
-// 但 schema 编译产物完全独立、互不浪费）。
+// validator.cpp
+// Dual-engine routing: fast path (SIMD) and slow path (AST interpreter)
 // =============================================================================
 #include "iris/validator.hpp"
 
@@ -61,7 +51,7 @@ Validator Validator::from_schema_json(std::string_view schema_json,
 #else
         v.path_ = EnginePath::kFastInterpret;
 #endif
-        // 还原 Fast Path 的合成 kind（kAlwaysValid / kAlwaysInvalid）
+        // restore fast path synthetic kinds (kAlwaysValid / kAlwaysInvalid)
         switch (v.fast_schema_.kind) {
             case SchemaKind::kAlwaysValid:   v.path_ = EnginePath::kAlwaysValid;   break;
             case SchemaKind::kAlwaysInvalid: v.path_ = EnginePath::kAlwaysInvalid; break;
@@ -87,9 +77,9 @@ Validator Validator::from_schema_json(std::string_view schema_json,
 
 bool Validator::add_remote_document(std::string uri, std::string_view json) noexcept {
     if (!slow_schema_) {
-        // 如果当前 Validator 只编译了 Fast Path，需要把 schema 再编一遍 Slow，
-        // 以便注入远端。Fast 仍然保留可用。如果 fast 自带的 schema_json 没存，
-        // 我们没法 re-compile —— 此时认为调用方使用错误，安静返回 false。
+        // If only fast path compiled, recompile slow schema
+        // for remote injection. Fast path stays usable. Without stored schema_json,
+        // cannot recompile — caller misuse; return false.
         return false;
     }
     return slow_schema_add_remote(*slow_schema_, std::move(uri), json);
@@ -105,7 +95,7 @@ ValidationReport Validator::validate(std::string_view json) const noexcept {
         }
         case EnginePath::kSlowFallback:
             if (slow_schema_) return validate_slow_path(json, *slow_schema_);
-            // legacy 通道：Inspector 投否决但只持有 CompiledSchema —— 显式失败
+            // legacy: Inspector veto with CompiledSchema only — explicit failure
             return validate_slow_path(json, fast_schema_);
         case EnginePath::kFastJit:
             if (jit_fn_) {
@@ -116,7 +106,7 @@ ValidationReport Validator::validate(std::string_view json) const noexcept {
         case EnginePath::kFastInterpret:
         default:
             if (has_fast_) return ::iris::validate(json, fast_schema_);
-            // 既没 fast 也没 slow → fail-safe
+            // neither fast nor slow → fail-safe
             ValidationReport r; r.code = ValidationError::kNotImplemented; return r;
     }
 }

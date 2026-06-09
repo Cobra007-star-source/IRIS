@@ -1,26 +1,6 @@
 // =============================================================================
-// src/parser.cpp
-//
-// Fused Parse & Validate kernel — 递归版（Phase 4 升级）
-//
-// 入口：validate() → validate_object()
-//
-// 三个互相递归的内部函数：
-//
-//   validate_object(c, schema)
-//        当 c.peek()=='{' 时进入。展开字段 → key 解析 → value dispatch。
-//        遇到 properties[k].type=object 且 nested_object[k]!=null → 递归 validate_object()
-//        遇到 properties[k].type=array  且 array_item_type[k]!=0   → 递归 validate_array()
-//
-//   validate_array(c, item_type, item_nested)
-//        当 c.peek()=='[' 时进入。逐元素 dispatch → 类型校验。
-//        item 若为 object 且 item_nested!=null → 递归 validate_object()
-//        item 若为 array 当前 Fast Path 仅做结构跳过（数组嵌套数组属长尾，留 Phase 5）。
-//
-//   validate_value(c, constraint)
-//        single value dispatcher，统一处理标量 + 嵌套递归。
-//
-// 错误一旦触发立即返回，沿调用栈逐级冒泡——天然的"错误熔断"。
+// parser.cpp
+// Fused parse-and-validate kernel (recursive, Phase 4)
 // =============================================================================
 #include "iris/parser.hpp"
 
@@ -33,9 +13,9 @@
 namespace {
 
 // Count Unicode codepoints in a JSON-encoded string body (without surrounding quotes).
-// 输入是 scan_string 返回的原始字节范围——含 \" / \\ / \u.... 等 escape sequence。
-// Surrogate pair (\uD800-DBFF 后跟 \uDC00-DFFF) 视为 1 codepoint。
-// 与 spec "string length is the number of characters" 对齐。
+// Input is raw byte range from scan_string — escapes \" / \\ / \u....
+// Surrogate pair (\uD800-DBFF then \uDC00-DFFF) counts as one codepoint.
+// Aligns with spec "string length is the number of characters".
 inline std::uint32_t json_string_codepoints(const std::uint8_t* p, std::uint32_t n) noexcept {
     auto hex_val = [](std::uint8_t c) noexcept -> int {
         if (c >= '0' && c <= '9') return c - '0';
@@ -114,7 +94,7 @@ struct Cursor {
     }
 };
 
-// 单 SIMD pass 字符串扫描（仅闭合 '"' 与转义 '\\' 在一次扫描中定位）
+// Single SIMD pass: locate closing '"' and escapes '\\' in one scan
 [[nodiscard]] IRIS_FORCE_INLINE bool scan_string(Cursor& c, std::uint32_t& out_off,
                                                  std::uint32_t& out_len) noexcept {
     ++c.pos;
@@ -135,7 +115,7 @@ struct Cursor {
     return false;
 }
 
-// 通用括号平衡跳过：当 nested 信息不可用时退回到结构性校验
+// Generic bracket-balanced skip when nested info unavailable
 [[nodiscard]] bool skip_balanced(Cursor& c) noexcept {
     if (c.eof()) return false;
     std::uint8_t open = c.peek();
@@ -161,7 +141,7 @@ struct Cursor {
 }
 
 struct NumberScan {
-    bool         is_integer  = false;   // lexical 形态：无小数点 / 无指数
+    bool         is_integer  = false;   // lexical form: no fraction / no exponent
     bool         is_number   = false;
     std::int64_t int_value   = 0;
     double       dbl_value   = 0.0;
@@ -210,7 +190,7 @@ NumberScan scan_number(const std::uint8_t* data, std::size_t size, std::size_t p
         }
         r.dbl_value = static_cast<double>(r.int_value);
     } else {
-        // 浮点：用 from_chars 解析；失败的话退化为 0（不会影响 type 校验的正确性）
+        // float: from_chars parse; on failure use 0 (does not break type check)
         auto first = reinterpret_cast<const char*>(data + start);
         auto last  = reinterpret_cast<const char*>(data + pos);
         std::from_chars(first, last, r.dbl_value);
@@ -251,28 +231,28 @@ ValidationReport validate_array(Cursor& c, TypeMask item_type,
 // -----------------------------------------------------------------------------
 // dispatch_value
 //
-// 故意写成宏 + 大 switch 块：避免函数边界扼杀内联。
-// 当前 value 的所有约束以局部变量出现在调用点，避免 ValueConstraint 整体构造。
+// Macro + large switch by design: avoid function boundaries blocking inlining.
+// All constraints as locals at call site; avoid ValueConstraint aggregate.
 //
-// 退出条件：
-//   - 失败：在主调函数里 return 错误
-//   - 成功：cursor 已推过该 value，继续后续 ',' / '}' 判定
+// Exit conditions:
+//   - failure: return error from caller
+//   - success: cursor past value; continue ',' / '}' handling
 // -----------------------------------------------------------------------------
 //
-// 用 #define 是经过权衡的：
-//   - inline 函数：编译器对递归函数禁用内联，标量路径性能掉 30%
-//   - lambda：捕获太多变量，反而劣化
-//   - 宏：直接展开到调用点，无成本
+// #define chosen after tradeoffs:
+//   - inline: compiler disables inlining in recursive path (~30% scalar loss)
+//   - lambda: too many captures, worse codegen
+//   - macro: expands at call site, zero overhead
 //
-// 调用上下文必须暴露：
+// Call site must expose:
 //   c, schema(unused for array), allowed, obj_sub, item_type, item_nested,
 //   min_string_len, max_string_len, min_int, max_int, slot, seen_mask
-// 失败处理通过 `return make_err(...)` 体现。
+// Failures via `return make_err(...)`.
 //
-// 宏会展开为：根据 c.peek() 的值跳转处理；失败 return，成功 break 后继续。
+// Macro dispatches on c.peek(); fail return, success break and continue.
 //
-// 字符串长度按 UTF-8 codepoint 计数（spec 要求）。我们只在 schema 显式设了
-// min/maxLength 时才扫一遍计 codepoint —— ASCII-only schema 上 zero cost。
+// String length by UTF-8 codepoint (per spec). Scan only when schema sets
+// min/maxLength — zero cost on ASCII-only schemas.
 #define IRIS_VALIDATE_SCALAR_AT(head_)                                              \
     do {                                                                             \
         switch (head_) {                                                             \
@@ -359,8 +339,8 @@ ValidationReport validate_array(Cursor& c, TypeMask item_type,
 // -----------------------------------------------------------------------------
 // validate_array
 //
-// 处理任意 item_type；item 若为 object 且 item_nested!=null → 递归 validate_object()。
-// 内部 loop 局部变量为 item 路径的"伪 slot=-1"约束。
+// Handle any item_type; object + item_nested → recurse validate_object().
+// Inner loop locals are pseudo slot=-1 constraints for item path.
 // -----------------------------------------------------------------------------
 ValidationReport validate_array(Cursor& c, TypeMask item_type,
                                 const CompiledSchema* item_nested) noexcept {
@@ -390,7 +370,7 @@ ValidationReport validate_array(Cursor& c, TypeMask item_type,
         c.skip_ws();
         if (c.eof()) return make_err(ValidationError::kInvalidJson, c.pos);
         std::uint8_t head = c.peek();
-        // 宏依赖名为 item_type / item_nested 的本地变量；用同名变量映射
+        // macro expects locals item_type / item_nested; map with same names
         TypeMask              item_type      = inner_item_type;
         const CompiledSchema* item_nested    = inner_item_nested;
         IRIS_VALIDATE_SCALAR_AT(head);
@@ -462,7 +442,7 @@ ValidationReport validate_object(Cursor& c, const CompiledSchema& schema) noexce
         c.skip_ws();
         if (c.eof()) return make_err(ValidationError::kInvalidJson, c.pos, slot, seen_mask);
 
-        // 把 slot 的约束取出到一组寄存器变量（无堆查询，全在 L1）
+        // load slot constraints into register locals (no heap; L1-friendly)
         TypeMask              allowed        = (slot >= 0) ? schema.types[slot] : static_cast<TypeMask>(0xFF);
         const CompiledSchema* obj_sub        = (slot >= 0) ? schema.nested_object[slot].get() : nullptr;
         TypeMask              item_type      = (slot >= 0) ? schema.array_item_type[slot] : 0;
@@ -526,12 +506,12 @@ const char* validation_error_name(ValidationError e) noexcept {
 
 namespace {
 
-// 跑一个 value root schema：cursor 处当前是任意 JSON value 起点。
-// 复用 IRIS_VALIDATE_SCALAR_AT 宏（需要把宏在这个 TU 内重新定义；它在
-// validate_object/array 后面已经 #undef）。这里手写等价分支，避免再展开。
+// Run value-root schema: cursor at start of any JSON value.
+// Reuse IRIS_VALIDATE_SCALAR_AT (would need redefine in this TU; it was
+// #undef'd after validate_object/array). Hand-written equivalent branches here.
 ValidationReport validate_value_root(Cursor& c, const CompiledSchema& schema) noexcept {
     if (schema.types.empty()) {
-        // 任意值都接受
+        // accept any value
         return make_ok(c.pos);
     }
     const TypeMask              allowed        = schema.types[0];

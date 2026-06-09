@@ -1,11 +1,11 @@
 // =============================================================================
 // examples/phase1_demo.cpp
 //
-// Phase 1: 在 256 MiB 随机文本上对比 SIMD 与标量的 byte-count 吞吐。
-// 用来建立白皮书要求的“硅基物理直觉”。
+// Phase 1: SIMD vs scalar byte-count throughput on 256 MiB random text.
+// Builds physical intuition for the whitepaper.
 //
-// 没有引入 Google Benchmark 依赖，使用 chrono 自己测；
-// 报告 GB/s 与加速比。
+// No Google Benchmark; uses chrono;
+// reports GB/s and speedup.
 // =============================================================================
 #include <chrono>
 #include <cstdio>

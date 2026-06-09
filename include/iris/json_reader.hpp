@@ -1,14 +1,14 @@
 // =============================================================================
 // iris/json_reader.hpp
 //
-// 通用 JSON 读取器 (bootstrap 用途)
+// General-purpose JSON reader (bootstrap use)
 //
-// 设计定位：
-//   - 不在热路径上。仅在 schema 编译期解析 schema.json
-//   - 因此牺牲性能换 API 友好度：返回 std::variant 风格的 JsonValue
-//   - 没有 SAX、没有 DOD，10MB schema 解析 <1ms 已经远超需求
+// Design positioning:
+//   - Off the hot path. Only parses schema.json at schema compile time
+//   - Trades performance for API ergonomics: returns JsonValue variant style
+//   - No SAX, no DOD; 10MB schema parse <1ms far exceeds requirements
 //
-// 如果将来要"用 IRIS 解析 IRIS schema"，把这块换成 fused pipeline 即可。
+// If we later "parse IRIS schema with IRIS", replace this with the fused pipeline.
 // =============================================================================
 #pragma once
 
@@ -57,7 +57,7 @@ public:
     [[nodiscard]] const JsonArray&    as_array()  const noexcept { return *a_; }
     [[nodiscard]] const JsonObject&   as_object() const noexcept { return *o_; }
 
-    // 在 object 中找 key，未找到返回 nullptr。线性扫描（schema 字段少，O(N) OK）。
+    // Find key in object; nullptr if not found. Linear scan (few schema fields, O(N) OK).
     [[nodiscard]] const JsonValue* find(std::string_view key) const noexcept {
         if (!o_) return nullptr;
         for (auto& [k, v] : *o_) if (k == key) return &v;
@@ -79,11 +79,11 @@ private:
 struct JsonParseResult {
     bool         ok = false;
     JsonValue    value;
-    std::string  diagnostic;  // 仅在 ok==false 时填充
+    std::string  diagnostic;  // filled only when ok==false
     std::size_t  error_offset = 0;
 };
 
-// 解析整段 JSON 文档。允许尾部 whitespace。
+// Parse a full JSON document. Trailing whitespace allowed.
 [[nodiscard]] JsonParseResult parse_json(std::string_view text);
 
 }  // namespace iris

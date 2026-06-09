@@ -1,17 +1,17 @@
 // =============================================================================
-// iris/jit.hpp  (Phase 3 骨架)
+// iris/jit.hpp  (Phase 3 skeleton)
 //
-// JIT 引擎接口：
-//   - 接收 CompiledSchema -> 在内存中生成 ARM NEON / x64 AVX2 校验机器码
-//   - 通过 W^X 安全门完成 RW → RX 权限翻转
-//   - Mac 上额外处理 MAP_JIT + pthread_jit_write_protect_np
+// JIT engine interface:
+//   - Accept CompiledSchema -> generate ARM NEON / x64 AVX2 validation machine code
+//   - W^X safety gate: RW -> RX permission flip
+//   - macOS: MAP_JIT + pthread_jit_write_protect_np
 //
-// 当前是 stub：JitValidator::compile 返回空指针表示尚未实现，
-// 上层 Validator 会自动 fallback 到解释执行的 Fast Path。
+// Currently stub: JitValidator::compile returns nullptr when not implemented;
+// upper Validator falls back to interpreted Fast Path.
 //
-// 推荐后续接入：
+// Recommended future integrations:
 //   - asmjit (https://asmjit.com) — header-only friendly
-//   - cranelift (Rust，可走 cbindgen)
+//   - cranelift (Rust, via cbindgen)
 // =============================================================================
 #pragma once
 
@@ -29,11 +29,11 @@ using JitValidatorFn = ValidationReport (*)(const std::uint8_t* data,
                                             std::size_t size,
                                             const CompiledSchema& schema) noexcept;
 
-// Compiler API demo（验证 asmjit::Compiler 的虚拟寄存器分配 + 自动溢出）
+// Compiler API demo (verify asmjit::Compiler virtual register allocation + auto spill)
 using JitDemoFn = std::uint64_t (*)(std::uint64_t seed) noexcept;
 
-// 一段 W^X 受控的可执行 trampoline。
-// 不可拷贝，析构时归还 mmap 区域。
+// W^X-controlled executable trampoline.
+// Non-copyable; returns mmap region on destroy.
 class IRIS_CACHE_ALIGNED ExecutableBuffer : public NonCopyable {
 public:
     ExecutableBuffer() = default;
@@ -42,14 +42,14 @@ public:
     ExecutableBuffer(ExecutableBuffer&&) noexcept;
     ExecutableBuffer& operator=(ExecutableBuffer&&) noexcept;
 
-    // 申请一块 RW 内存，写入 N 字节代码后调用 freeze() 翻转为 RX。
+    // Allocate RW memory, write N bytes, then freeze() to RX.
     [[nodiscard]] static std::unique_ptr<ExecutableBuffer> create(std::size_t size);
 
     [[nodiscard]] std::uint8_t* writable() noexcept { return writable_; }
     [[nodiscard]] const std::uint8_t* code() const noexcept { return executable_; }
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
-    // 翻转权限：写入完成后调用。失败返回 false（错误信息打到 stderr）。
+    // Flip permissions after writing. Returns false on failure (error to stderr).
     [[nodiscard]] bool freeze() noexcept;
 
 private:
@@ -59,13 +59,13 @@ private:
     bool          frozen_     = false;
 };
 
-// 把 CompiledSchema 编译为 JIT 函数。返回 nullptr 表示当前平台暂未实现，
-// 上层应回退到解释 Fast Path。
+// Compile CompiledSchema to JIT function. nullptr means not implemented on this platform;
+// caller should fall back to interpreted Fast Path.
 [[nodiscard]] JitValidatorFn jit_compile(const CompiledSchema& schema,
                                          std::unique_ptr<ExecutableBuffer>& out_buffer) noexcept;
 
-// Compiler API demo —— 用 asmjit::Compiler 生成一段会强制虚拟寄存器溢出
-// 的函数，返回 (seed XOR 链尾值)。失败返回 nullptr。
+// Compiler API demo — asmjit::Compiler generates a function that forces virtual register
+// spill; returns (seed XOR chain tail). nullptr on failure.
 [[nodiscard]] JitDemoFn jit_compile_compiler_demo() noexcept;
 
 }  // namespace iris::jit

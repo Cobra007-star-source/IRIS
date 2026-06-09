@@ -1,21 +1,6 @@
 // =============================================================================
-// bench/conformance.cpp
-//
-// JSON Schema Test Suite 合规性 runner
-//
-// 走一遍 https://github.com/json-schema-org/JSON-Schema-Test-Suite
-// 的 draft2020-12 目录，把每个 case 的 schema 喂给 IRIS，再把每条 instance
-// 跑过 Validator，与官方 expected 对比。
-//
-// 输出按文件分类的表格 + 三种口径的合格率：
-//
-//   raw     = pass / total                  // 严格视角（skipped 算失败）
-//   attempt = pass / (pass + fail)          // 我们答了的题答对率
-//   skip%   = skipped / total               // schema 编译失败比（不支持的关键字）
-//
-// 用法：
-//   conformance <draft_dir> [--verbose]
-//   conformance .test-suite/tests/draft2020-12 --verbose
+// conformance.cpp
+// JSON Schema Test Suite conformance runner for draft2020-12
 // =============================================================================
 #include <algorithm>
 #include <cstdio>
@@ -105,10 +90,10 @@ struct FileStats {
     int total   = 0;
     int passed  = 0;
     int failed  = 0;
-    int skipped = 0;   // schema 不能编译（无 fast 也无 slow）
+    int skipped = 0;   // schema did not compile (no fast or slow)
     int errored = 0;
-    int by_fast = 0;   // 被 Fast Path 接管的题
-    int by_slow = 0;   // 被 Slow Path 接管的题
+    int by_fast = 0;   // cases handled by fast path
+    int by_slow = 0;   // cases handled by slow path
 };
 
 std::string slurp(const fs::path& p) {
@@ -117,8 +102,8 @@ std::string slurp(const fs::path& p) {
     return ss.str();
 }
 
-// 收集 .test-suite/remotes/** 下所有 .json 文件，按 "http://localhost:1234/<rel>"
-// 的 URI 注入到 Validator。返回 (uri, content) 列表，多个 Validator 共享之。
+// Collect .test-suite/remotes/**/*.json as http://localhost:1234/<rel>
+// Inject into Validator; return shared (uri, content) list.
 using RemoteList = std::vector<std::pair<std::string, std::string>>;
 
 RemoteList load_remotes(const fs::path& remotes_dir) {
@@ -154,7 +139,7 @@ void run_file(const fs::path& p, FileStats& s, bool verbose, const RemoteList& r
         iris::Validator vv = iris::Validator::from_schema_json(schema_str, vb);
         bool used_slow = vv.has_slow_path();
 
-        // 给 Slow Path 灌远端文档：$ref 解析需要
+        // inject remote docs for slow path $ref resolution
         if (used_slow) {
             for (auto& [uri, body] : remotes) {
                 vv.add_remote_document(uri, body);
@@ -215,7 +200,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // 找 .test-suite/remotes/，路径相对于 dir 向上两层。允许 --remotes 覆盖。
+    // Find .test-suite/remotes/ two levels above dir; --remotes overrides.
     fs::path remotes_dir;
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--remotes") == 0 && i + 1 < argc) {

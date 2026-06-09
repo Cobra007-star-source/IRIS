@@ -1,18 +1,17 @@
 // =============================================================================
-// iris/inspector.hpp  (Phase 4 骨架)
+// iris/inspector.hpp  (Phase 4 skeleton)
 //
-// AST Inspector ("冷启动安检员")
+// AST Inspector ("cold-start security inspector")
 //
-// 职责：
-//   - 在 schema 加载阶段做静态拓扑扫描
-//   - 拦截会引爆 Fast Path 的“变态规则”：
-//       * $ref 环路 (Tarjan SCC > 1 即触发)
+// Responsibilities:
+//   - Static topology scan at schema load time
+//   - Block pathological rules that would break Fast Path:
+//       * $ref cycles (Tarjan SCC size > 1)
 //       * unevaluatedProperties
-//       * 嵌套深度爆炸
-//       * 已知 ReDoS 风险的 pattern
+//       * nested depth explosion
+//       * known ReDoS-risk patterns
 //
-// 决策结果驱动 Validator 路由：能上 Fast Path 上 Fast Path，
-// 否则进入慢车道。
+// Verdict drives Validator routing: Fast Path when possible, else slow path.
 // =============================================================================
 #pragma once
 
@@ -25,8 +24,8 @@
 namespace iris {
 
 struct SchemaInspectionInput {
-    // Phase 4 真正接入 JSON Schema 树时，这里改为 IR / DAG 引用。
-    // 当前用 stub：完全静态。
+    // Phase 4: replace with JSON Schema tree IR / DAG references.
+    // Current stub: fully static.
     std::vector<std::vector<std::uint32_t>> ref_graph;
     bool has_unevaluated_properties = false;
     std::uint32_t max_depth = 0;
@@ -42,7 +41,7 @@ struct InspectionResult {
     std::string       reason;
 };
 
-// 执行 Tarjan SCC + 复合规则判定。
+// Run Tarjan SCC + composite rule checks.
 InspectionResult inspect(const SchemaInspectionInput& input) noexcept;
 
 }  // namespace iris

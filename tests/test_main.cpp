@@ -1,12 +1,12 @@
 // =============================================================================
 // tests/test_main.cpp
 //
-// 极简手写测试框架。
+// Minimal hand-rolled test framework.
 //
-// 选择不引入 GoogleTest / Catch2 是因为：
-//   - 减少首次构建的依赖与网络
-//   - 测试规模目前 < 50 个 case
-//   - 任何 CI 失败的复盘成本都是最低的
+// We avoid GoogleTest / Catch2 because:
+//   - Reduces first-build dependencies and network fetches
+//   - Test count is currently < 50 cases
+//   - Lowest possible CI failure triage cost
 // =============================================================================
 #include <cstdio>
 #include <vector>

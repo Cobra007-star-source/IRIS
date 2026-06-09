@@ -1,13 +1,6 @@
 // =============================================================================
-// src/json_reader.cpp
-//
-// 递归下降 JSON 解析器。
-//
-// 不在热路径。约 250 行，完整支持 JSON RFC 8259 主体（除以下简化）：
-//   - \u 仅做 4 位十六进制串吞咽（不解 surrogate pair）
-//   - 数字限定 IEEE-754 double / int64 表示范围内
-//
-// 任何错误立即终止并报告偏移。
+// json_reader.cpp
+// Recursive-descent JSON parser (off the hot path)
 // =============================================================================
 #include "iris/json_reader.hpp"
 
@@ -92,8 +85,8 @@ JsonValue parse_string(Reader& r, ParserCtx& ctx) {
                     };
                     unsigned cp = 0;
                     if (!parse4(cp)) return ctx.fail(r, "bad \\u escape");
-                    // 处理 UTF-16 surrogate pair：high surrogate (D800-DBFF)
-                    // 后跟 \uDC00-DFFF → 合并为 1 个真实 codepoint
+                    // UTF-16 surrogate pair: high surrogate (D800-DBFF)
+                    // followed by \uDC00-DFFF → merge into one codepoint
                     if (cp >= 0xD800 && cp <= 0xDBFF) {
                         if (r.p + 6 <= r.end && r.p[0] == '\\' && r.p[1] == 'u') {
                             r.p += 2;
@@ -102,17 +95,17 @@ JsonValue parse_string(Reader& r, ParserCtx& ctx) {
                             if (low >= 0xDC00 && low <= 0xDFFF) {
                                 cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
                             } else {
-                                // 单独 surrogate—— spec 不允许；按 U+FFFD 处理
+                                // lone surrogate — spec forbids; use U+FFFD
                                 cp = 0xFFFD;
                             }
                         }
-                        // 孤悬 high surrogate：编码为 U+FFFD（替代字符）
+                        // dangling high surrogate: encode as U+FFFD
                         else cp = 0xFFFD;
                     } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-                        // 孤悬 low surrogate
+                        // dangling low surrogate
                         cp = 0xFFFD;
                     }
-                    // 转 UTF-8 (1-4 bytes)
+                    // encode as UTF-8 (1-4 bytes)
                     if (cp < 0x80) {
                         out.push_back(static_cast<char>(cp));
                     } else if (cp < 0x800) {

@@ -1,21 +1,21 @@
 // =============================================================================
 // iris/token_stream.hpp
 //
-// SoA Token 流 (Phase 2)
+// SoA token stream (Phase 2)
 //
-// 关键决策：放弃 AoS 的 struct Token { TokenKind k; uint32_t off; uint32_t len; ... }
-// 改用并行数组：
+// Key decision: drop AoS struct Token { TokenKind k; uint32_t off; uint32_t len; ... }
+// in favor of parallel arrays:
 //
-//   kinds : uint8_t[]   (1 byte/elem, 64 个一行 cache line)
+//   kinds : uint8_t[]   (1 byte/elem, 64 per cache line)
 //   offsets: uint32_t[] (4 byte/elem)
 //   lengths: uint32_t[] (4 byte/elem)
 //
-// 这样:
-//   - 仅做类型判断的状态机一次性 prefetch 64 个 kind，几乎全部命中 L1
-//   - 仅做位置定位的代码不必为 kind 浪费带宽
-//   - 类型分支可以用 SIMD 一次性比对 16 个 token
+// Benefits:
+//   - Type-only state machines prefetch 64 kinds at once, mostly L1 hits
+//   - Position-only code does not waste bandwidth on kind
+//   - Type branches can SIMD-compare 16 tokens at once
 //
-// Token 数组同样是 64 字节对齐的 over-aligned 分配，配合 std::span 暴露给上层。
+// Token arrays are 64-byte aligned over-aligned allocations, exposed upstream via std::span.
 // =============================================================================
 #pragma once
 
@@ -27,8 +27,8 @@
 
 namespace iris {
 
-// 极简 token 集合：目标是覆盖 JSON 八种结构 token。
-// 数值用 0..7 紧排，方便 8-bit 比较与跳转表。
+// Minimal token set: cover eight JSON structural tokens.
+// Values 0..7 packed for 8-bit compare and jump tables.
 enum class TokenKind : std::uint8_t {
     kObjectOpen   = 0,  // {
     kObjectClose  = 1,  // }
@@ -55,7 +55,7 @@ inline constexpr const char* token_kind_name(TokenKind k) noexcept {
     }
 }
 
-// SoA 视图（不持有所有权，由 TokenStream 拥有）
+// SoA view (non-owning; owned by TokenStream)
 struct TokenView {
     std::span<const std::uint8_t> kinds;
     std::span<const std::uint32_t> offsets;
@@ -64,12 +64,12 @@ struct TokenView {
     [[nodiscard]] std::size_t size() const noexcept { return kinds.size(); }
 };
 
-// 拥有所有权、64 字节对齐的 token 流容器。
+// Owning, 64-byte-aligned token stream container.
 //
-// 不是 std::vector：因为我们要：
-//   1. 强制 64B 对齐（DOD）
-//   2. 不抛异常、不调 ctor/dtor（TriviallyCopyable，POD）
-//   3. 一次性 reserve，避免 realloc 抖动
+// Not std::vector because we need:
+//   1. Forced 64B alignment (DOD)
+//   2. No exceptions, no ctor/dtor (trivially copyable POD)
+//   3. One-shot reserve to avoid realloc jitter
 class IRIS_CACHE_ALIGNED TokenStream : public NonCopyable {
 public:
     TokenStream() = default;

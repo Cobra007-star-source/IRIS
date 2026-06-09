@@ -88,7 +88,7 @@ IRIS_TEST(validate_whitespace_and_unicode) {
 }
 
 IRIS_TEST(validate_nested_value_skipped) {
-    // schema 不允许 active 之外的字段，但允许的字段值如果是对象时，会被 skip_balanced 跳过
+    // schema forbids fields other than active; object values use skip_balanced
     using namespace iris;
     std::array<FieldSpec, 2> fields = {{
         {"name", kTypeString, true,  0, 16, 0, 200},
@@ -126,13 +126,13 @@ IRIS_TEST(validate_nested_object_schema) {
 
     IRIS_EXPECT(v.validate(R"({"name":"Iris","addr":{"city":"SF","zip":"94101"}})").ok());
     IRIS_EXPECT(v.validate(R"({"name":"Iris","addr":{"city":"SF"}})").ok());
-    // nested 缺少 required.city
+    // nested missing required.city
     auto r1 = v.validate(R"({"name":"Iris","addr":{"zip":"94101"}})");
     IRIS_EXPECT(r1.code == ValidationError::kMissingRequired);
-    // nested 多余字段（addr.additionalProperties=false）
+    // nested extra field (addr.additionalProperties=false)
     auto r2 = v.validate(R"({"name":"Iris","addr":{"city":"SF","country":"US"}})");
     IRIS_EXPECT(r2.code == ValidationError::kUnknownField);
-    // nested 类型错（zip 不是字符串）
+    // nested type error (zip not string)
     auto r3 = v.validate(R"({"name":"Iris","addr":{"city":"SF","zip":12345}})");
     IRIS_EXPECT(r3.code == ValidationError::kTypeMismatch);
 }
@@ -152,7 +152,7 @@ IRIS_TEST(validate_array_of_strings) {
 
     IRIS_EXPECT(v.validate(R"({"tags":["a","b","c"]})").ok());
     IRIS_EXPECT(v.validate(R"({"tags":[]})").ok());
-    // 一个 item 类型错
+    // one item has wrong type
     auto r = v.validate(R"({"tags":["a",2,"c"]})");
     IRIS_EXPECT(r.code == ValidationError::kTypeMismatch);
 }

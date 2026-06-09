@@ -81,7 +81,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/json-schema-org/JSON-Schema-Test-Suite.git .test-suite
           ./build/bench/conformance .test-suite/tests/draft2020-12 | tee conformance.txt
-          # 双引擎接入后准确率门槛上调到 99%（attempted），raw 不低于 88%
+          # With dual-engine routing: attempted pass rate >= 99%, raw >= 88%
           awk '/^attempted/ { gsub("%","",$7); rate=$7+0; print "[ci] attempted=" rate "%"; if (rate < 99.0) { print "FAIL: attempted pass rate below 99%"; exit 1 } }' conformance.txt
           awk '/^raw/       { gsub("%","",$7); rate=$7+0; print "[ci] raw=" rate "%";       if (rate < 88.0) { print "FAIL: raw pass rate below 88%";       exit 1 } }' conformance.txt
 

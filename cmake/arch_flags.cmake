@@ -1,15 +1,16 @@
 # -----------------------------------------------------------------------------
 # arch_flags.cmake
 #
-# 物理级优化必须依赖具体 ISA。这里集中决定 SIMD 指令集与代码生成基线，
-# 避免在源代码里到处散布 #ifdef。
+# Physical-level optimization depends on a specific ISA. This file centralizes
+# SIMD instruction-set and code-generation baselines, avoiding scattered #ifdef
+# in source code.
 # -----------------------------------------------------------------------------
 
 set(IRIS_ARCH_FLAGS "")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(arm64|aarch64)")
     set(IRIS_TARGET_ISA "arm64-neon" CACHE INTERNAL "Detected SIMD ISA")
-    # Apple Silicon / ARM64 默认开启 NEON，这里显式声明便于编译期断言
+    # Apple Silicon / ARM64 enables NEON by default; declare explicitly for compile-time assertions
     list(APPEND IRIS_ARCH_FLAGS
         -march=armv8.4-a+fp16
         -ffast-math

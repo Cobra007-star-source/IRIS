@@ -1,18 +1,6 @@
 // =============================================================================
-// src/perfect_hash.cpp
-//
-// 实用版完美哈希构造：
-//
-//   1. 设 N = keys.size()
-//   2. 选 seed1，使 slot1[i] = fnv64(seed1, key_i) % N 全部互不相同
-//      → 即直接命中。对 N <= 32 这种典型 schema 字段量基本一次成功。
-//   3. 若一次性 seed1 冲突，再叠加 seed2 做二次 FNV，把整体哈希视为
-//      H(key) = fnv64(seed2, key)；模 N 得到槽位。
-//
-// 这种做法不是教科书 CHD（CHD 用双 hash + displacement table），但对 N <= 1024
-// 的 schema 字段量已经稳定收敛，并且实现极短，不引入第三方依赖。
-//
-// 后续 Phase 3 JIT 阶段可直接 emit seed 立即数，把 lookup 折成 5~6 条指令。
+// perfect_hash.cpp
+// Practical perfect-hash construction for schema field names (FNV-based)
 // =============================================================================
 #include "iris/perfect_hash.hpp"
 
