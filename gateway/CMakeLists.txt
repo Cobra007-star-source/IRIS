@@ -22,6 +22,27 @@ target_compile_features(iris_net PUBLIC cxx_std_20)
 target_compile_options(iris_net PRIVATE ${IRIS_ARCH_FLAGS})
 target_link_libraries(iris_net PUBLIC picohttpparser Threads::Threads)
 
+# Optional async PostgreSQL engine (TFB /db, /queries, /updates, /fortunes).
+# Detect libpq via plain find_path/find_library so it works with Debian's
+# libpq-dev (standard paths) and Homebrew's keg-only libpq (explicit hints).
+if(IRIS_BUILD_DB)
+    find_path(PQ_INCLUDE_DIR libpq-fe.h
+        HINTS /opt/homebrew/opt/libpq/include /usr/local/opt/libpq/include
+              /usr/include /usr/include/postgresql)
+    find_library(PQ_LIBRARY NAMES pq libpq
+        HINTS /opt/homebrew/opt/libpq/lib /usr/local/opt/libpq/lib
+              /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib64)
+    if(PQ_INCLUDE_DIR AND PQ_LIBRARY)
+        message(STATUS "[iris] libpq        : ${PQ_LIBRARY}")
+        target_sources(iris_net PRIVATE ${CMAKE_SOURCE_DIR}/src/db/pg.cpp)
+        target_include_directories(iris_net PRIVATE ${PQ_INCLUDE_DIR})
+        target_link_libraries(iris_net PUBLIC ${PQ_LIBRARY})
+        target_compile_definitions(iris_net PUBLIC IRIS_HAVE_LIBPQ=1)
+    else()
+        message(STATUS "[iris] libpq        : not found; DB routes disabled")
+    endif()
+endif()
+
 # Deployment profile: racing (epoll/SO_REUSEPORT/pinned) vs production (portable).
 if(IRIS_PROFILE STREQUAL "racing")
     target_compile_definitions(iris_net PUBLIC IRIS_PROFILE_RACING=1)

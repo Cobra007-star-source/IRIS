@@ -7,7 +7,7 @@ the next measurement must prove**.
 
 ---
 
-## 1. Scope shipped (Phases 0–2 complete, Phase 3 partial)
+## 1. Scope shipped (Phases 0–2 + DB beachhead complete, Phase 3 partial)
 
 | Phase | Deliverable | State |
 |-------|-------------|:----:|
@@ -20,6 +20,7 @@ the next measurement must prove**.
 | P2 | **JIT `/json` serializer**: asmjit block-write codegen, dual backend (aarch64 + x86-64), opt-in via `-DIRIS_ENABLE_JIT=ON` | ✅ (see §3) |
 | P2 | TFB harness: `iris.dockerfile`, `benchmark_config.json`, `scripts/loadtest.sh`, correctness | ✅ (Docker build verified; Linux native build on AL2023 — see §5) |
 | P3 | `perf` counters + flamegraph + perf map, bare-metal report | ⏳ Phase 1 loopback on Linux **done** (§5–§6); NIC-saturated score + PMU on metal — see §7 |
+| DB | Async `libpq` engine → `/db`, `/queries`, `/updates`, `/fortunes` (pipeline reads, id-sorted bulk update, HTML-escaped fortunes, per-worker pool + waiter queue) | ✅ (see §8) |
 
 ## 2. Architecture (as built)
 
@@ -198,8 +199,57 @@ correct `Date`/`Server` headers, NIC/CPU saturation on the load generator. With
 `/json serializer: JIT block-write (27 bytes)` and compare `/json` IPC / branch-
 miss counters against the C++-serializer build to quantify the block-write win.
 
-## 8. Deferred — second beachhead
+## 8. Second beachhead — async PostgreSQL data routes ✅
 
-Async pipelined Postgres driver → `/db`, `/queries`, `/updates`,
-`/cached-queries`; `/fortunes` (DB fetch + sort + HTML template + SIMD XSS
-escape reusing `src/simd_ops.cpp`).
+Phase 2 of the gateway: a non-blocking `libpq` engine wired into the same
+thread-per-core event loop, delivering the four TFB database routes. Built
+shared-nothing — each worker owns a private connection pool, so the DB path
+inherits the zero-shared-state property of §2.
+
+- **`iris::db::PgConn` — thin async libpq wrapper** (`include/iris/db/pg.hpp`,
+  `src/db/pg.cpp`). Cold path (startup) blocks for `PQconnectdb` + `PQprepare`;
+  hot path is fully non-blocking (`PQsendQueryPrepared`/`PQsendQuery`, `PQflush`,
+  `PQconsumeInput`, `PQisBusy`, `PQgetResult`) and uses **binary result format**
+  for `World` rows (`int4` decoded as 4-byte big-endian, no text parsing).
+- **Per-worker connection pool + fd→slot map + FIFO waiter queue.** When the
+  pool is saturated the suspended HTTP connection is queued (with a generation
+  counter to drop clients that disconnected while waiting) instead of returning
+  `503`. The pool size is the knob against Postgres `max_connections`
+  (`--db-pool N`, `pool × workers` total).
+- **Async suspend/resume.** A handler that needs the DB returns
+  `Outcome::kSuspended`; the DB socket fd is registered with the worker's
+  `Poller`, the `DbJob` state machine drives `libpq` to completion, and the HTTP
+  connection is resumed — preserving keep-alive request order.
+- **Routes:**
+  - **`/db`** — one random `World` row, single prepared SELECT.
+  - **`/queries?queries=N`** — N rows via **libpq pipeline mode** (one batch of
+    independent prepared SELECTs, no `IN`/`ANY`, per TFB rules); `N` clamped to
+    `[1,500]` (missing/non-numeric → 1).
+  - **`/updates?queries=N`** — N random reads, then a single bulk `UPDATE …
+    FROM (VALUES …)` with rows **sorted by `id`** so concurrent transactions
+    take row locks in a global order → no deadlocks.
+  - **`/fortunes`** — all rows + the one canonical "Additional fortune added at
+    request time." row, sorted by message text, rendered with HTML escaping
+    (`& < > " '`, UTF-8 preserved).
+- **Connection robustness.** Pipelined routes (`/queries`) call `pipeline_exit()`
+  before the slot returns to the pool; if it fails (or the connection is found
+  bad on an idle health check) the slot reconnects in place rather than handing a
+  wedged connection to the next request.
+
+**Verified locally** (1 worker, `--db-pool 4`, Postgres in Docker, TFB seed):
+per-route correctness incl. byte-exact `/fortunes`; `/queries` clamping; keep-
+alive reuse of a single connection across pipelined→non-pipelined routes; and a
+1200-request / 96-concurrency mixed-route stress with **0 non-200, 0 hangs, 0
+deadlocks** against a pool of 4 (exercising the waiter queue and pipeline-exit
+reuse path).
+
+### Out of scope for the TFB path (whitepaper features deliberately cut)
+
+- **kTLS / kernel-TLS offload** — TFB has no HTTPS track, so a TLS path scores
+  nothing. Removed from the benchmarking roadmap entirely; the gateway listens
+  plaintext only.
+- **Adaptive / tiered JIT machinery** (hotspot detection, EBR reclamation,
+  bailout + deopt, safepoints, snapshot replay). Every gateway hot path has a
+  schema/shape that is **fixed at startup**, so there is nothing to profile,
+  re-tier, or deoptimize. The one JIT we keep is the startup-AOT block-write
+  `/json` serializer (§3) — code generated once, never re-specialized.

@@ -1,21 +1,22 @@
 // =============================================================================
 // src/net/server.cpp
 //
-// Thread-per-core HTTP/1.1 event loop.
+// Thread-per-core HTTP/1.1 event loop with an optional async PostgreSQL engine.
 //
 //   * One worker per core; each owns a Poller, a SO_REUSEPORT listener (racing
-//     profile), and a pool of Connections with fixed read/write buffers.
-//   * Level-triggered readiness. Reads drain the socket, parse every pipelined
-//     request, and batch all responses into one write buffer flushed with a
-//     single send() (writev is reserved for the later scatter-gather body path).
-//   * Zero allocation in steady state: connection objects and their buffers are
-//     recycled through a per-worker free list.
-//
-// Backpressure / pipelining correctness: request views point into the read
-// buffer, so the buffer is only compacted after a request's response has been
-// produced, or just before returning when a mid-batch flush blocks (in which
-// case the still-unprocessed bytes are preserved at the front and reprocessed
-// when the socket becomes writable again).
+//     profile), a pool of Connections with fixed read/write buffers, and -- when
+//     DB is configured -- a pool of long-lived libpq connections whose sockets
+//     are registered in the same poller.
+//   * Level-triggered readiness. Sync routes (/plaintext, /json) parse every
+//     pipelined request and batch responses into one write buffer.
+//   * Async DB routes (/db, /queries, /updates, /fortunes) suspend the HTTP
+//     connection, issue a non-blocking query on a pooled DB connection, and are
+//     completed when that DB socket becomes readable -- then the HTTP connection
+//     resumes. Connection bring-up and PREPARE happen once at startup (blocking,
+//     cold path); only the per-request round-trip is async.
+//   * Zero allocation in steady state: HTTP connections and their buffers are
+//     recycled through a per-worker free list; DB connections and their job
+//     accumulators are fixed pools.
 // =============================================================================
 #include "iris/net/server.hpp"
 
@@ -23,13 +24,21 @@
 #include "iris/net/socket.hpp"
 #include "iris/http/date.hpp"
 #include "iris/http/parser.hpp"
+#include "iris/http/response.hpp"
+
+#if defined(IRIS_HAVE_LIBPQ)
+    #include "iris/db/pg.hpp"
+#endif
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <sys/socket.h>
@@ -77,8 +86,12 @@ int make_listener(std::uint16_t port, bool reuseport, int backlog) noexcept {
 namespace {
 
 // Max bytes any single response can occupy; drain() guarantees this much room
-// before invoking the handler. TFB responses are < 300 bytes.
-constexpr std::size_t kRespReserve = 2048;
+// before invoking the handler. Sized for /queries (up to 500 rows of JSON).
+constexpr std::size_t kRespReserve = 24576;
+
+// TFB World table key space and the per-request query fan-out clamp.
+constexpr int kWorldRows  = 10000;
+constexpr int kMaxQueries = 500;
 
 #if defined(__linux__)
 void pin_to_cpu(int cpu) noexcept {
@@ -91,18 +104,87 @@ void pin_to_cpu(int cpu) noexcept {
 void pin_to_cpu(int /*cpu*/) noexcept {}
 #endif
 
+// Per-worker PRNG for World ids. xorshift64 is plenty for picking a uniform id
+// in [1, kWorldRows]; the bias from % is negligible at this range and TFB does
+// not require cryptographic randomness.
+std::uint32_t rng_next() noexcept {
+    static thread_local std::uint64_t s = [] {
+        auto t = std::chrono::steady_clock::now().time_since_epoch().count();
+        return static_cast<std::uint64_t>(t) ^
+               (reinterpret_cast<std::uint64_t>(&errno) * 0x9E3779B97F4A7C15ull) ^ 0x2545F4914F6CDD1Dull;
+    }();
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return static_cast<std::uint32_t>(s);
+}
+int random_world_id() noexcept {
+    return 1 + static_cast<int>(rng_next() % kWorldRows);
+}
+
+enum class CState : std::uint8_t { kActive, kAwaitDb };
+
 struct Connection {
-    int         fd                = -1;
-    bool        want_write        = false;
-    bool        close_after_flush = false;
-    std::size_t rlen  = 0;   // valid bytes in rbuf
-    std::size_t wlen  = 0;   // valid bytes in wbuf
-    std::size_t wsent = 0;   // bytes of wbuf already written
-    std::size_t rcap  = 0;
-    std::size_t wcap  = 0;
-    char*       rbuf  = nullptr;
-    char*       wbuf  = nullptr;
+    int           fd                = -1;
+    CState        state             = CState::kActive;
+    int           db_slot           = -1;     // owning DB pool slot while serving
+    std::uint32_t gen               = 0;      // bumped on release; invalidates
+                                              //   stale waiter-queue entries
+    DbRoute       pend_route        = DbRoute::kWorldOne;  // queued request intent
+    int           pend_count        = 0;                   //   "
+    int           req_minor         = 1;      // stashed at suspend for the reply
+    bool          req_keep_alive    = true;   //   "
+    bool          want_write        = false;
+    bool          close_after_flush = false;
+    bool          read_paused       = false;  // poller read interest dropped
+                                              //   (rbuf full while suspended)
+    std::size_t   rlen  = 0;   // valid bytes in rbuf
+    std::size_t   wlen  = 0;   // valid bytes in wbuf
+    std::size_t   wsent = 0;   // bytes of wbuf already written
+    std::size_t   rcap  = 0;
+    std::size_t   wcap  = 0;
+    char*         rbuf  = nullptr;
+    char*         wbuf  = nullptr;
 };
+
+#if defined(IRIS_HAVE_LIBPQ)
+// One in-flight DB request. Lives in the worker's DB pool (one per connection
+// slot), not per HTTP connection, so the row accumulators cost
+// pool_per_worker * ~4KB rather than per-client.
+struct DbJob {
+    Connection*  http        = nullptr;  // suspended HTTP conn (null => orphaned)
+    DbRoute      route       = DbRoute::kWorldOne;
+    int          total       = 0;        // queries requested
+    int          recv        = 0;        // tuple results received
+    int          sent        = 0;        // queries dispatched
+    bool         want_write  = false;    // flush blocked; waiting for writable
+    bool         failed      = false;    // a result came back in error
+    bool         active      = false;    // a query is in flight on this slot
+    bool         pipelined   = false;    // select fan-out used pipeline mode
+    bool         sync_seen   = false;    // PGRES_PIPELINE_SYNC consumed
+    int          html_len    = -1;       // /fortunes: prebuilt body length in
+                                        //   tls_body (-1 => not built)
+    std::int32_t ids[kMaxQueries];
+    std::int32_t rns[kMaxQueries];
+};
+
+// Upper bound on Fortune rows we render (12 canonical + 1 appended + slack).
+constexpr int kMaxFortunes = 64;
+
+// Prepared-statement names + SQL, created on every pooled connection at bringup.
+constexpr const char* kStmtWorldSelect = "iris_world_select";
+constexpr const char* kSqlWorldSelect  =
+    "SELECT id, randomNumber FROM World WHERE id = $1";
+constexpr const char* kStmtFortuneAll  = "iris_fortune_all";
+constexpr const char* kSqlFortuneAll   = "SELECT id, message FROM Fortune";
+// /updates bulk write: one prepared statement taking the (id, rn) pairs as two
+// parallel int4 arrays. Replaces per-request SQL text assembly: nothing to
+// build or parse per request beyond two small array literals.
+constexpr const char* kStmtWorldBulk = "iris_world_bulk";
+constexpr const char* kSqlWorldBulk  =
+    "UPDATE World SET randomNumber = u.rn "
+    "FROM unnest($1::int4[], $2::int4[]) AS u(id, rn) WHERE World.id = u.id";
+#endif  // IRIS_HAVE_LIBPQ
 
 struct Worker {
     Poller                    poller;
@@ -112,6 +194,19 @@ struct Worker {
     std::size_t               wcap     = 32768;
     std::vector<Connection*>  by_fd;
     std::vector<Connection*>  freelist;
+
+#if defined(IRIS_HAVE_LIBPQ)
+    bool                      db_enabled = false;
+    DbFormatters              fmt{};
+    std::vector<db::PgConn>   db_conns;
+    std::vector<DbJob>        db_jobs;
+    std::vector<int>          db_idle;        // free slot indices
+    std::vector<int>          db_slot_by_fd;  // fd -> slot, -1 if not a DB fd
+    std::string               db_conninfo;
+    // FIFO of connections suspended because every DB slot was busy. Each entry
+    // carries the connection's generation so a recycled connection is skipped.
+    std::deque<std::pair<Connection*, std::uint32_t>> db_waiters;
+#endif
 
     Connection* acquire(int fd) {
         Connection* c;
@@ -126,8 +221,11 @@ struct Worker {
             c->wcap = wcap;
         }
         c->fd = fd;
+        c->state = CState::kActive;
+        c->db_slot = -1;
         c->want_write = false;
         c->close_after_flush = false;
+        c->read_paused = false;
         c->rlen = c->wlen = c->wsent = 0;
         if (static_cast<std::size_t>(fd) >= by_fd.size()) by_fd.resize(fd + 1, nullptr);
         by_fd[fd] = c;
@@ -135,12 +233,25 @@ struct Worker {
     }
 
     void release(Connection* c) {
+#if defined(IRIS_HAVE_LIBPQ)
+        // If a DB query is still in flight for this connection, orphan the job
+        // rather than reusing the slot: the result must still be drained before
+        // the DB connection can serve another request.
+        if (c->db_slot >= 0) {
+            db_jobs[c->db_slot].http = nullptr;
+            c->db_slot = -1;
+        }
+#endif
         if (c->fd >= 0) {
             poller.del(c->fd);
             ::close(c->fd);
             if (static_cast<std::size_t>(c->fd) < by_fd.size()) by_fd[c->fd] = nullptr;
             c->fd = -1;
         }
+        // Invalidate any queued waiter entry that still points at this object
+        // (it will be reused for a different client).
+        ++c->gen;
+        c->state = CState::kActive;
         freelist.push_back(c);
     }
 
@@ -149,8 +260,506 @@ struct Worker {
     }
 };
 
-// Flush pending [wsent, wlen). Returns false to close the connection (fatal
-// error, or a graceful close requested after the final byte is sent).
+// Forward decls (sync path).
+bool flush(Worker& w, Connection& c);
+bool drain(Worker& w, Connection& c);
+
+// ---- async DB engine --------------------------------------------------------
+#if defined(IRIS_HAVE_LIBPQ)
+
+// Response body scratch. Built first (so Content-Length is known), then handed
+// to write_response. 32 KiB covers /queries' 500-row array and /fortunes.
+thread_local char tls_body[32768];
+
+// Forward decls for the mutually-recursive release <-> dispatch path.
+void db_start_on_slot(Worker& w, int slot, Connection* c);
+void db_fail(Worker& w, int slot);
+void db_recover(Worker& w, int slot);
+
+int db_acquire(Worker& w) {
+    if (w.db_idle.empty()) return -1;
+    int slot = w.db_idle.back();
+    w.db_idle.pop_back();
+    return slot;
+}
+
+// Return a slot to the pool, then immediately hand it to the next valid waiter
+// (FIFO). Skips stale waiters (client gone / connection recycled).
+void db_release(Worker& w, int slot) {
+    DbJob& j = w.db_jobs[slot];
+    j.http = nullptr;
+    j.recv = j.sent = j.total = 0;
+    j.failed = false;
+    j.active = false;
+    j.want_write = false;
+    j.pipelined = false;
+    j.sync_seen = false;
+    j.html_len = -1;
+    w.db_idle.push_back(slot);
+
+    while (!w.db_waiters.empty()) {
+        auto [c, gen] = w.db_waiters.front();
+        w.db_waiters.pop_front();
+        if (c->gen != gen || c->state != CState::kAwaitDb || c->db_slot != -1)
+            continue;  // stale entry
+        int s = db_acquire(w);
+        if (s < 0) {  // someone raced us; requeue and stop
+            w.db_waiters.emplace_front(c, gen);
+            break;
+        }
+        db_start_on_slot(w, s, c);
+        break;
+    }
+}
+
+// Big-endian encode for binary int4 query parameters: skips the snprintf here
+// AND the server-side text->int parse the text format would force.
+inline void be32(char* p, std::uint32_t v) noexcept {
+    p[0] = static_cast<char>(v >> 24);
+    p[1] = static_cast<char>(v >> 16);
+    p[2] = static_cast<char>(v >> 8);
+    p[3] = static_cast<char>(v);
+}
+constexpr int kParamLen4[1]  = {4};
+constexpr int kParamFmtBin[1] = {1};
+
+// Append a positive integer's decimal digits to `p`; returns chars written.
+inline std::size_t put_uint(char* p, std::uint32_t v) noexcept {
+    char tmp[10];
+    int  n = 0;
+    do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v);
+    for (int i = 0; i < n; ++i) p[i] = tmp[n - 1 - i];
+    return static_cast<std::size_t>(n);
+}
+
+// Send one World select (binary id param, binary result). Used by /db.
+bool db_send_world_select(Worker& w, int slot) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    char idbuf[4];
+    be32(idbuf, static_cast<std::uint32_t>(random_world_id()));
+    const char* values[1] = {idbuf};
+    if (!pc.send_prepared(kStmtWorldSelect, 1, values, kParamLen4, kParamFmtBin,
+                          /*result_binary=*/true)) {
+        return false;
+    }
+    ++j.sent;
+    return true;
+}
+
+// Enter pipeline mode and fan out `n` independent World selects (PG14+). TFB
+// forbids collapsing the reads into a single IN/ANY query, so each id is its
+// own prepared-statement execution; pipelining only batches the round-trip.
+// `ids` selects fixed ids (the /updates pre-generated set); nullptr draws a
+// fresh random id per select (/queries). Does NOT sync: the caller appends any
+// further pipelined commands and then calls pipeline_sync().
+bool db_send_select_batch(Worker& w, int slot, int n, const std::int32_t* ids) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    if (!pc.pipeline_enter()) return false;
+    j.pipelined = true;
+    char idbuf[4];
+    for (int i = 0; i < n; ++i) {
+        be32(idbuf, static_cast<std::uint32_t>(ids ? ids[i] : random_world_id()));
+        const char* values[1] = {idbuf};
+        if (!pc.send_prepared(kStmtWorldSelect, 1, values, kParamLen4,
+                              kParamFmtBin, /*result_binary=*/true)) {
+            return false;
+        }
+    }
+    j.sent = n;
+    return true;
+}
+
+// Queue the /updates bulk write onto the SAME pipeline as its selects: the ids
+// and replacement values are generated client-side before dispatch, so nothing
+// in the UPDATE depends on the select results. Pipeline order guarantees the
+// server executes every read before the write, and the whole route costs ONE
+// network round-trip. Params are the two int4 arrays in text form ("{a,b,c}").
+bool db_send_bulk_update(Worker& w, int slot) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    char ida[4096], rna[4096];  // 500 ids of <=5 digits + commas + braces + NUL
+    std::size_t la = 0, lr = 0;
+    ida[la++] = '{';
+    rna[lr++] = '{';
+    for (int i = 0; i < j.total; ++i) {
+        if (i) { ida[la++] = ','; rna[lr++] = ','; }
+        la += put_uint(ida + la, static_cast<std::uint32_t>(j.ids[i]));
+        lr += put_uint(rna + lr, static_cast<std::uint32_t>(j.rns[i]));
+    }
+    ida[la++] = '}'; ida[la] = '\0';
+    rna[lr++] = '}'; rna[lr] = '\0';
+    const char* values[2] = {ida, rna};
+    return pc.send_prepared(kStmtWorldBulk, 2, values, nullptr, nullptr,
+                            /*result_binary=*/false);
+}
+
+// Sort the (id, rn) accumulators by id. A consistent ascending lock order is
+// the standard guard against deadlocks when concurrent /updates transactions
+// touch overlapping rows. n is small (<=500), so an insertion sort on the
+// parallel arrays is cache-friendly and avoids packing into pairs.
+void db_sort_by_id(std::int32_t* ids, std::int32_t* rns, int n) {
+    for (int i = 1; i < n; ++i) {
+        const std::int32_t id = ids[i], rn = rns[i];
+        int k = i - 1;
+        while (k >= 0 && ids[k] > id) {
+            ids[k + 1] = ids[k];
+            rns[k + 1] = rns[k];
+            --k;
+        }
+        ids[k + 1] = id;
+        rns[k + 1] = rn;
+    }
+}
+
+// Flush buffered output and register/refresh writable interest if the flush is
+// incomplete. Returns false on a send error (caller must fail the job).
+[[nodiscard]] bool db_arm_flush(Worker& w, int slot) {
+    DbJob& j  = w.db_jobs[slot];
+    int    fd = w.db_conns[slot].socket();
+    const int f = w.db_conns[slot].flush();
+    if (f < 0) return false;
+    if (f == 1) {
+        if (!j.want_write) {
+            w.poller.mod(fd, kReadable | kWritable);
+            j.want_write = true;
+        }
+    } else if (j.want_write) {
+        w.poller.mod(fd, kReadable);
+        j.want_write = false;
+    }
+    return true;
+}
+
+// Bind connection `c`'s pending request to DB pool `slot`, dispatch the query,
+// and mark the connection as serving on that slot. On dispatch failure the
+// request is failed (500) and the slot recovered.
+void db_start_on_slot(Worker& w, int slot, Connection* c) {
+    DbJob& j     = w.db_jobs[slot];
+    j.http       = c;
+    j.route      = c->pend_route;
+    j.recv       = 0;
+    j.sent       = 0;
+    j.failed     = false;
+    j.active     = true;
+    j.want_write = false;
+    j.pipelined  = false;
+    j.sync_seen  = false;
+    j.html_len   = -1;
+
+    const int n = c->pend_count < 1 ? 1
+                : (c->pend_count > kMaxQueries ? kMaxQueries : c->pend_count);
+
+    bool dispatched = false;
+    switch (c->pend_route) {
+        case DbRoute::kWorldOne:
+            j.total    = 1;
+            dispatched = db_send_world_select(w, slot);
+            break;
+        case DbRoute::kWorldMany:
+            j.total    = n;
+            dispatched = db_send_select_batch(w, slot, n, nullptr) &&
+                         w.db_conns[slot].pipeline_sync();
+            break;
+        case DbRoute::kWorldUpdate:
+            // Generate ids and replacement values up front, sorted by id (the
+            // ascending lock order is the deadlock guard), then pipeline the N
+            // mandated row reads AND the bulk write in one round-trip.
+            j.total = n;
+            for (int i = 0; i < n; ++i) {
+                j.ids[i] = random_world_id();
+                j.rns[i] = random_world_id();
+            }
+            db_sort_by_id(j.ids, j.rns, n);
+            dispatched = db_send_select_batch(w, slot, n, j.ids) &&
+                         db_send_bulk_update(w, slot) &&
+                         w.db_conns[slot].pipeline_sync();
+            break;
+        case DbRoute::kFortunes:
+            j.total    = 0;
+            dispatched = w.db_conns[slot].send_query(kSqlFortuneAll);
+            ++j.sent;
+            break;
+    }
+
+    if (!dispatched) {
+        c->db_slot = -1;
+        db_fail(w, slot);
+        return;
+    }
+    c->db_slot = slot;
+    if (!db_arm_flush(w, slot)) db_fail(w, slot);
+}
+
+// Return a finished slot to the pool, but reconnect first if the connection is
+// no longer in a clean idle state (bad link, or stuck in pipeline mode). This
+// is what keeps a connection reusable across different route types.
+void db_return_slot(Worker& w, int slot, bool force_recover) {
+    if (force_recover || w.db_conns[slot].is_bad()) {
+        db_recover(w, slot);
+    } else {
+        db_release(w, slot);
+    }
+}
+
+// Finish a completed job: format the body, assemble the response onto the HTTP
+// connection, return the DB slot, then resume the HTTP connection.
+void db_finish_ex(Worker& w, int slot, bool force_recover) {
+    DbJob&      j = w.db_jobs[slot];
+    Connection* c = j.http;
+
+    if (c == nullptr) {        // orphaned (client vanished mid-query)
+        db_return_slot(w, slot, force_recover);
+        return;
+    }
+
+    iris::http::Buffer body(tls_body, sizeof(tls_body));
+    std::string_view   ctype = "application/json";
+
+    if (j.failed) {
+        // DB-level error: 500 and close. Rare; keeps the pool honest.
+        iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+        iris::http::write_response(ob, 500, "Internal Server Error", "text/plain",
+                                   "db error", c->req_minor, false);
+        c->wlen = ob.size();
+        c->close_after_flush = true;
+    } else {
+        std::string_view payload;
+        switch (j.route) {
+            case DbRoute::kWorldOne:
+                if (w.fmt.world_one) w.fmt.world_one(body, j.ids[0], j.rns[0]);
+                payload = body.view();
+                break;
+            case DbRoute::kWorldMany:
+            case DbRoute::kWorldUpdate:
+                if (w.fmt.world_many)
+                    w.fmt.world_many(body, j.ids, j.rns, j.recv);
+                payload = body.view();
+                break;
+            case DbRoute::kFortunes:
+                ctype = "text/html; charset=UTF-8";
+                // Body was rendered into tls_body during db_pump (messages were
+                // still live then); emit it verbatim.
+                payload = std::string_view(tls_body,
+                              j.html_len > 0 ? static_cast<std::size_t>(j.html_len) : 0);
+                break;
+        }
+        const std::size_t  before = c->wlen;
+        iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+        iris::http::write_response(ob, 200, "OK", ctype, payload, c->req_minor,
+                                   c->req_keep_alive);
+        if (ob.overflow()) {
+            // drain() reserves kRespReserve before suspending, so this is
+            // unreachable by construction -- but a truncated 200 would hang the
+            // client on a short body, so fail loudly instead.
+            c->wlen = before;
+            iris::http::Buffer eb(c->wbuf, c->wcap, c->wlen);
+            iris::http::write_response(eb, 500, "Internal Server Error",
+                                       "text/plain", "response overflow",
+                                       c->req_minor, false);
+            c->wlen = eb.size();
+            c->close_after_flush = true;
+        } else {
+            c->wlen = ob.size();
+            if (!c->req_keep_alive) c->close_after_flush = true;
+        }
+    }
+
+    // Return the DB slot before touching the HTTP socket so it is available
+    // again even if the client write fails.
+    c->db_slot = -1;
+    c->state   = CState::kActive;
+    db_return_slot(w, slot, force_recover);
+
+    if (c->read_paused) {  // rbuf filled while suspended; restore read interest
+        w.poller.mod(c->fd, kReadable);
+        c->read_paused = false;
+    }
+    if (!flush(w, *c)) { w.release(c); return; }
+    // Drain any pipelined bytes that arrived while suspended.
+    if (c->state == CState::kActive && c->rlen > 0) {
+        if (!drain(w, *c)) w.release(c);
+    }
+}
+
+inline void db_finish(Worker& w, int slot) { db_finish_ex(w, slot, false); }
+
+// Drop a slot index out of the idle free list (used when an idle connection
+// dies and cannot be re-established). O(pool size), which is tiny.
+void db_drop_idle(Worker& w, int slot) {
+    for (auto it = w.db_idle.begin(); it != w.db_idle.end(); ++it) {
+        if (*it == slot) { w.db_idle.erase(it); return; }
+    }
+}
+
+// Blocking reconnect + re-prepare of a single slot, re-registering its (new) fd
+// in the poller. Returns false if the connection could not be re-established.
+bool db_reconnect_slot(Worker& w, int slot) {
+    db::PgConn& pc     = w.db_conns[slot];
+    const int   old_fd = pc.socket();
+    if (old_fd >= 0) {
+        w.poller.del(old_fd);
+        if (static_cast<std::size_t>(old_fd) < w.db_slot_by_fd.size())
+            w.db_slot_by_fd[old_fd] = -1;
+    }
+    if (!pc.connect(w.db_conninfo.c_str()) ||
+        !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
+        !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
+        !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)) {
+        std::fprintf(stderr, "[iris-gw] DB slot %d reconnect failed: %s\n", slot,
+                     pc.error().c_str());
+        return false;
+    }
+    const int fd = pc.socket();
+    if (static_cast<std::size_t>(fd) >= w.db_slot_by_fd.size())
+        w.db_slot_by_fd.resize(fd + 1, -1);
+    w.db_slot_by_fd[fd] = slot;
+    w.poller.add(fd, kReadable);
+    return true;
+}
+
+// Recover a slot whose in-flight query failed: reconnect and return it to the
+// pool (db_release), or drop it from rotation if reconnection fails.
+void db_recover(Worker& w, int slot) {
+    if (db_reconnect_slot(w, slot)) {
+        db_release(w, slot);  // back to idle (also pulls the next waiter)
+    }
+    // else: not in db_idle (it was active), so capacity simply shrinks.
+}
+
+// A DB connection-level failure while serving `slot`: fail the HTTP request,
+// then recover the connection.
+void db_fail(Worker& w, int slot) {
+    DbJob& j = w.db_jobs[slot];
+    if (j.http) {
+        Connection* c = j.http;
+        iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+        iris::http::write_response(ob, 500, "Internal Server Error", "text/plain",
+                                   "db error", c->req_minor, false);
+        c->wlen = ob.size();
+        c->close_after_flush = true;
+        c->db_slot = -1;
+        c->state = CState::kActive;
+        j.http = nullptr;
+        if (c->read_paused) {
+            w.poller.mod(c->fd, kReadable);
+            c->read_paused = false;
+        }
+        if (!flush(w, *c)) w.release(c);
+    }
+    db_recover(w, slot);
+}
+
+// All results for the current command/pipeline have been consumed (take_result
+// returned null past any sync). The job is complete for every route: /updates'
+// bulk write rides the same pipeline as its selects, so there is no second
+// phase.
+void db_on_command_complete(Worker& w, int slot) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+
+    // A pipelined fan-out (/queries, /updates) leaves the connection in
+    // pipeline mode. It MUST exit before the slot is reused by a non-pipelined
+    // route (/db prepared-without-sync would hang; /fortunes simple-query is
+    // illegal in pipeline mode). If exit fails, force a reconnect so the pool
+    // never hands out a wedged connection.
+    bool force_recover = false;
+    if (j.pipelined) {
+        if (!pc.pipeline_exit()) force_recover = true;
+        j.pipelined = false;
+    }
+    db_finish_ex(w, slot, force_recover);
+}
+
+// Drain every result currently buffered on a ready DB connection, threading the
+// pipeline's NULL separators and the PGRES_PIPELINE_SYNC marker.
+void db_pump(Worker& w, int slot) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+
+    if (!pc.consume_input()) { db_fail(w, slot); return; }
+
+    for (;;) {
+        if (pc.is_busy()) return;  // results not fully arrived; wait for readable
+        pg_result* r = pc.take_result();
+        if (r == nullptr) {
+            // NULL separates queries in a pipeline; only the NULL past the sync
+            // (or the lone NULL of a non-pipelined command) means "complete".
+            if (j.pipelined && !j.sync_seen) continue;
+            db_on_command_complete(w, slot);
+            return;
+        }
+        if (db::result_is_pipeline_sync(r)) {
+            j.sync_seen = true;
+        } else if (db::result_is_error(r)) {
+            j.failed = true;
+        } else if (j.route == DbRoute::kFortunes && db::result_ok_tuples(r)) {
+            // The whole table arrives in one result. Decode + render the HTML
+            // body NOW, while the message string_views still point into `r`.
+            FortuneRow tmp[kMaxFortunes];
+            const int  rows = db::result_rows(r);
+            int        m    = 0;
+            for (int i = 0; i < rows && m < kMaxFortunes; ++i, ++m) {
+                std::int32_t id = 0;
+                for (char ch : db::text_field(r, i, 0))
+                    if (ch >= '0' && ch <= '9') id = id * 10 + (ch - '0');
+                tmp[m].id      = id;
+                tmp[m].message = db::text_field(r, i, 1);
+            }
+            iris::http::Buffer body(tls_body, sizeof(tls_body));
+            if (w.fmt.fortunes) w.fmt.fortunes(body, tmp, m);
+            j.html_len = static_cast<int>(body.size());
+        } else if (db::result_ok_tuples(r) && db::result_rows(r) >= 1) {
+            // /updates already holds its (sorted) ids and replacement values;
+            // the select results only confirm the reads happened. Recording
+            // them would clobber the new values, so only count those.
+            if (j.route != DbRoute::kWorldUpdate) {
+                const int idx = j.recv < kMaxQueries ? j.recv : kMaxQueries - 1;
+                j.ids[idx] = db::bin_int4(r, 0, 0);
+                j.rns[idx] = db::bin_int4(r, 0, 1);
+            }
+            ++j.recv;
+        }
+        // The bulk-update COMMAND_OK result carries no payload; fall through.
+        db::clear_result(r);
+    }
+}
+
+void on_db_event(Worker& w, int slot, std::uint32_t flags) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+
+    // An event on an idle slot is not a query result -- it is almost always the
+    // server closing an idle connection (EOF). Never run the result pump here
+    // (that would db_release an already-idle slot and duplicate it in the free
+    // list). Just clear readability and reconnect in place if the link broke.
+    if (!j.active) {
+        if (flags & kReadable) {
+            if (!pc.consume_input() || pc.is_bad()) {
+                if (!db_reconnect_slot(w, slot)) db_drop_idle(w, slot);
+            }
+        }
+        return;
+    }
+
+    if ((flags & kWritable) && j.want_write) {
+        const int f = pc.flush();
+        if (f < 0) { db_fail(w, slot); return; }
+        if (f == 0) {
+            w.poller.mod(pc.socket(), kReadable);
+            j.want_write = false;
+        }
+    }
+    if (flags & kReadable) {
+        db_pump(w, slot);
+    }
+}
+#endif  // IRIS_HAVE_LIBPQ
+
+// ---- sync HTTP path ---------------------------------------------------------
+
+// Flush pending [wsent, wlen). Returns false to close the connection.
 bool flush(Worker& w, Connection& c) {
     while (c.wsent < c.wlen) {
         ssize_t n = ::send(c.fd, c.wbuf + c.wsent, c.wlen - c.wsent, MSG_NOSIGNAL);
@@ -178,6 +787,8 @@ bool flush(Worker& w, Connection& c) {
 }
 
 // Parse and respond to every complete (pipelined) request currently buffered.
+// Stops early (returns true, leaving bytes in rbuf) if the connection suspends
+// on an async DB op.
 bool drain(Worker& w, Connection& c) {
     std::size_t off = 0;
     while (off < c.rlen) {
@@ -190,17 +801,32 @@ bool drain(Worker& w, Connection& c) {
         if (c.wcap - c.wlen < kRespReserve) {
             if (!flush(w, c)) return false;
             if (c.want_write) {
-                // Could not free space (write blocked). Preserve unprocessed
-                // input [off, rlen) at the front; resume when writable. `req`
-                // becomes invalid here but we return without using it.
                 std::memmove(c.rbuf, c.rbuf + off, c.rlen - off);
                 c.rlen -= off;
                 return true;
             }
         }
 
+        AsyncCtx ctx;
+        ctx.worker_ = &w;
+        ctx.conn_   = &c;
         iris::http::Buffer ob(c.wbuf, c.wcap, c.wlen);
-        w.handler(req, ob);
+        Outcome out = w.handler(req, ob, ctx);
+
+        if (out == Outcome::kSuspended) {
+            // The handler started an async DB op. Consume this request's bytes,
+            // stash reply context, and stop draining; the DB completion path
+            // resumes us. Any trailing pipelined bytes stay buffered.
+            off += pr.consumed;
+            c.req_minor      = req.minor_version;
+            c.req_keep_alive = req.keep_alive;
+            if (off > 0) {
+                std::memmove(c.rbuf, c.rbuf + off, c.rlen - off);
+                c.rlen -= off;
+            }
+            return true;
+        }
+
         c.wlen = ob.size();
         off += pr.consumed;
 
@@ -234,6 +860,19 @@ bool on_readable(Worker& w, Connection& c) {
             if (errno == EINTR) continue;
             return false;
         }
+    }
+    // While suspended on a DB op we accept bytes (to detect close) but must not
+    // re-enter the handler; the DB completion path drains them on resume. If
+    // the read buffer fills while suspended, drop read interest -- otherwise
+    // level-triggered polling would spin on this fd for the whole DB
+    // round-trip. Resume re-arms it. (Skipped when a write is armed so the
+    // writable notification is not lost; that combination self-resolves.)
+    if (c.state == CState::kAwaitDb) {
+        if (c.rlen == c.rcap && !c.read_paused && !c.want_write) {
+            w.poller.mod(c.fd, 0);
+            c.read_paused = true;
+        }
+        return true;
     }
     return drain(w, c);
 }
@@ -272,13 +911,23 @@ void worker_loop(Worker* wp, int cpu, bool pin) {
                 continue;
             }
 
+#if defined(IRIS_HAVE_LIBPQ)
+            if (w.db_enabled &&
+                static_cast<std::size_t>(fd) < w.db_slot_by_fd.size() &&
+                w.db_slot_by_fd[fd] >= 0) {
+                on_db_event(w, w.db_slot_by_fd[fd], fl);
+                continue;
+            }
+#endif
+
             Connection* c = w.find(fd);
             if (!c) continue;  // already released earlier in this batch
 
             bool ok = true;
             if (fl & kWritable) {
                 ok = flush(w, *c);
-                if (ok && c->wlen == 0 && c->rlen > 0) ok = drain(w, *c);
+                if (ok && c->wlen == 0 && c->state == CState::kActive && c->rlen > 0)
+                    ok = drain(w, *c);
             }
             if (ok && (fl & kReadable)) {
                 ok = on_readable(w, *c);
@@ -289,6 +938,34 @@ void worker_loop(Worker* wp, int cpu, bool pin) {
 }
 
 }  // namespace
+
+// AsyncCtx::run_db lives here so it can see the file-local Worker / Connection.
+bool AsyncCtx::run_db(DbRoute route, int count) noexcept {
+#if defined(IRIS_HAVE_LIBPQ)
+    Worker*     w = static_cast<Worker*>(worker_);
+    Connection* c = static_cast<Connection*>(conn_);
+    if (!w || !c || !w->db_enabled) return false;  // DB off => handler 503s
+
+    // Commit the connection to the async path: it is now suspended regardless of
+    // whether a slot is free (if not, it queues and resumes when one frees).
+    c->pend_route = route;
+    c->pend_count = count;
+    c->state      = CState::kAwaitDb;
+    c->db_slot    = -1;
+
+    int slot = db_acquire(*w);
+    if (slot < 0) {
+        w->db_waiters.emplace_back(c, c->gen);  // pool busy: wait FIFO
+        return true;
+    }
+    db_start_on_slot(*w, slot, c);
+    return true;
+#else
+    (void)route;
+    (void)count;
+    return false;
+#endif
+}
 
 int run_server(const ServerConfig& cfg, Handler handler) noexcept {
     ::signal(SIGPIPE, SIG_IGN);
@@ -303,8 +980,6 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
 #if !defined(SO_REUSEPORT)
     reuseport = false;
 #endif
-    // Without SO_REUSEPORT we cannot give each worker its own listener safely,
-    // so fall back to a single acceptor thread.
     if (!reuseport) workers = 1;
 
     std::vector<Worker*>     ws;
@@ -328,6 +1003,34 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
         }
         w->listener = lfd;
         w->poller.add(lfd, kReadable);
+
+#if defined(IRIS_HAVE_LIBPQ)
+        if (cfg.db.conninfo != nullptr) {
+            w->fmt         = cfg.db.fmt;
+            w->db_conninfo = cfg.db.conninfo;
+            const int n    = cfg.db.pool_per_worker > 0 ? cfg.db.pool_per_worker : 1;
+            w->db_conns.resize(n);
+            w->db_jobs.resize(n);
+            for (int s = 0; s < n; ++s) {
+                db::PgConn& pc = w->db_conns[s];
+                if (!pc.connect(cfg.db.conninfo) ||
+                    !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
+                    !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
+                    !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)) {
+                    std::fprintf(stderr, "[iris-gw] worker %d DB slot %d bringup "
+                                 "failed: %s\n", i, s, pc.error().c_str());
+                    return 1;
+                }
+                int dfd = pc.socket();
+                if (static_cast<std::size_t>(dfd) >= w->db_slot_by_fd.size())
+                    w->db_slot_by_fd.resize(dfd + 1, -1);
+                w->db_slot_by_fd[dfd] = s;
+                w->poller.add(dfd, kReadable);
+                w->db_idle.push_back(s);
+            }
+            w->db_enabled = true;
+        }
+#endif
         ws.push_back(w);
     }
 

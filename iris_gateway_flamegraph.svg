@@ -1,0 +1,1346 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="646" onload="init(evt)" viewBox="0 0 1200 646" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="646.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >IRIS /updates full-stack (c6in.4xlarge)</text>
+<text id="details" x="10.00" y="629" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="629" > </text>
+<g id="frames">
+<g >
+<title>_IO_default_xsputn (113,113,113 samples, 0.86%)</title><rect x="839.2" y="565" width="10.1" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="842.22" y="575.5" ></text>
+</g>
+<g >
+<title>__vsnprintf_internal (2,002,002 samples, 0.02%)</title><rect x="434.4" y="517" width="0.2" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="437.39" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (11,011,011 samples, 0.08%)</title><rect x="80.6" y="357" width="1.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="83.57" y="367.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,258,258,255 samples, 24.64%)</title><rect x="861.9" y="549" width="290.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="864.90" y="559.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,658,658,656 samples, 20.11%)</title><rect x="915.4" y="389" width="237.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="918.41" y="399.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,645,645,644 samples, 12.45%)</title><rect x="91.5" y="501" width="146.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="94.47" y="511.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQntuples@plt (3,003,003 samples, 0.02%)</title><rect x="44.9" y="549" width="0.3" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="47.93" y="559.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_arm_flush (8,008,008 samples, 0.06%)</title><rect x="451.5" y="501" width="0.8" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="454.54" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,100,100,099 samples, 8.32%)</title><rect x="331.0" y="341" width="98.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="334.04" y="351.5" >[[kernel.ka..</text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (15,015,015 samples, 0.11%)</title><rect x="83.6" y="549" width="1.3" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="86.60" y="559.5" ></text>
+</g>
+<g >
+<title>__memmove_evex_unaligned_erms (44,044,044 samples, 0.33%)</title><rect x="680.5" y="533" width="3.9" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="683.48" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,523,523,522 samples, 11.52%)</title><rect x="293.3" y="517" width="135.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="296.25" y="527.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,409,409,408 samples, 10.66%)</title><rect x="112.5" y="437" width="125.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="115.55" y="447.5" >[[kernel.kallsy..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (4,004,004 samples, 0.03%)</title><rect x="81.2" y="341" width="0.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.19" y="351.5" ></text>
+</g>
+<g >
+<title>__libc_recv (667,667,667 samples, 5.05%)</title><rect x="620.9" y="533" width="59.6" height="15.0" fill="rgb(233,129,31)" rx="2" ry="2" />
+<text  x="623.90" y="543.5" >__libc..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (268,268,268 samples, 2.03%)</title><rect x="57.6" y="501" width="24.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="60.61" y="511.5" >[..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (12,012,012 samples, 0.09%)</title><rect x="679.2" y="325" width="1.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="682.23" y="335.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="277" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="287.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="245" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="255.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,999,999,998 samples, 15.12%)</title><rect x="974.2" y="229" width="178.5" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="977.19" y="239.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (11,011,011 samples, 0.08%)</title><rect x="1151.7" y="69" width="1.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1154.68" y="79.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (9,009,009 samples, 0.07%)</title><rect x="695.3" y="533" width="0.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="698.31" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,467,467,466 samples, 11.10%)</title><rect x="298.3" y="437" width="130.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="301.26" y="447.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (862,862,862 samples, 6.53%)</title><rect x="352.2" y="149" width="77.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="355.21" y="159.5" >[[kernel..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (751,751,751 samples, 5.69%)</title><rect x="1085.6" y="85" width="67.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1088.58" y="95.5" >[[kerne..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (48,048,048 samples, 0.36%)</title><rect x="424.9" y="53" width="4.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="427.92" y="63.5" ></text>
+</g>
+<g >
+<title>_IO_str_init_static_internal (52,052,052 samples, 0.39%)</title><rect x="722.0" y="549" width="4.7" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="725.02" y="559.5" ></text>
+</g>
+<g >
+<title>iris::http::write_response (25,025,025 samples, 0.19%)</title><rect x="429.9" y="533" width="2.3" height="15.0" fill="rgb(207,12,3)" rx="2" ry="2" />
+<text  x="432.92" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (268,268,268 samples, 2.03%)</title><rect x="57.6" y="533" width="24.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="60.61" y="543.5" >[..</text>
+</g>
+<g >
+<title>__GI___pthread_enable_asynccancel (10,010,010 samples, 0.08%)</title><rect x="852.1" y="565" width="0.9" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="855.08" y="575.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (55,055,055 samples, 0.42%)</title><rect x="76.6" y="389" width="5.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="79.64" y="399.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (38,038,038 samples, 0.29%)</title><rect x="78.2" y="373" width="3.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="81.16" y="383.5" ></text>
+</g>
+<g >
+<title>appendBinaryPQExpBuffer (11,011,011 samples, 0.08%)</title><rect x="1160.7" y="565" width="1.0" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="1163.70" y="575.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="261" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="271.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_enable_asynccancel (9,009,009 samples, 0.07%)</title><rect x="55.3" y="549" width="0.8" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="58.29" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,134,134,132 samples, 16.14%)</title><rect x="962.2" y="277" width="190.5" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="965.22" y="287.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>__send (1,540,540,539 samples, 11.65%)</title><rect x="291.7" y="533" width="137.5" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="294.74" y="543.5" >__send</text>
+</g>
+<g >
+<title>iris-gw (13,223,223,210 samples, 100.00%)</title><rect x="10.0" y="581" width="1180.0" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" >iris-gw</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (554,554,554 samples, 4.19%)</title><rect x="630.8" y="453" width="49.5" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="633.82" y="463.5" >[[ke..</text>
+</g>
+<g >
+<title>[unknown] (2,002,002 samples, 0.02%)</title><rect x="680.3" y="517" width="0.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="683.30" y="527.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::flush (8,008,008 samples, 0.06%)</title><rect x="457.0" y="533" width="0.7" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="459.99" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,188,188,187 samples, 8.99%)</title><rect x="132.3" y="405" width="106.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="135.29" y="415.5" >[[kernel.kal..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (8,008,008 samples, 0.06%)</title><rect x="237.6" y="389" width="0.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="240.60" y="399.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (895,895,895 samples, 6.78%)</title><rect x="349.3" y="181" width="79.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="352.26" y="191.5" >[[kernel...</text>
+</g>
+<g >
+<title>iris::http::parse_request (8,008,008 samples, 0.06%)</title><rect x="429.2" y="533" width="0.7" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="432.21" y="543.5" ></text>
+</g>
+<g >
+<title>__errno_location (19,019,019 samples, 0.14%)</title><rect x="619.2" y="533" width="1.7" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="622.21" y="543.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::flush (3,003,003 samples, 0.02%)</title><rect x="238.9" y="549" width="0.2" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="241.85" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (572,572,572 samples, 4.33%)</title><rect x="629.2" y="469" width="51.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="632.21" y="479.5" >[[ker..</text>
+</g>
+<g >
+<title>_int_free (133,133,133 samples, 1.01%)</title><rect x="812.9" y="549" width="11.8" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="815.86" y="559.5" ></text>
+</g>
+<g >
+<title>malloc (227,227,227 samples, 1.72%)</title><rect x="1166.5" y="565" width="20.3" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1169.51" y="575.5" ></text>
+</g>
+<g >
+<title>__libc_recv (284,284,284 samples, 2.15%)</title><rect x="56.2" y="549" width="25.4" height="15.0" fill="rgb(233,129,31)" rx="2" ry="2" />
+<text  x="59.18" y="559.5" >_..</text>
+</g>
+<g >
+<title>PQgetResult (47,047,047 samples, 0.36%)</title><rect x="504.2" y="533" width="4.2" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="507.15" y="543.5" ></text>
+</g>
+<g >
+<title>PQpipelineSync (7,007,007 samples, 0.05%)</title><rect x="513.7" y="533" width="0.6" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="516.71" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,180,180,179 samples, 8.93%)</title><rect x="323.9" y="357" width="105.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="326.89" y="367.5" >[[kernel.kal..</text>
+</g>
+<g >
+<title>__memmove_evex_unaligned_erms (32,032,032 samples, 0.24%)</title><rect x="726.7" y="549" width="2.8" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="729.66" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (631,631,631 samples, 4.78%)</title><rect x="372.8" y="69" width="56.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="375.84" y="79.5" >[[ker..</text>
+</g>
+<g >
+<title>PQisBusy@plt (2,002,002 samples, 0.02%)</title><rect x="44.4" y="549" width="0.2" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="47.39" y="559.5" ></text>
+</g>
+<g >
+<title>iris::http::parse_request (46,046,046 samples, 0.35%)</title><rect x="438.4" y="517" width="4.1" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="441.41" y="527.5" ></text>
+</g>
+<g >
+<title>__snprintf (5,005,005 samples, 0.04%)</title><rect x="433.9" y="517" width="0.5" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="436.94" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (927,927,927 samples, 7.02%)</title><rect x="346.4" y="213" width="82.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="349.40" y="223.5" >[[kernel...</text>
+</g>
+<g >
+<title>__snprintf (12,012,012 samples, 0.09%)</title><rect x="81.6" y="549" width="1.0" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="84.55" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (91,091,091 samples, 0.69%)</title><rect x="73.4" y="405" width="8.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="76.42" y="415.5" ></text>
+</g>
+<g >
+<title>malloc (16,016,016 samples, 0.12%)</title><rect x="837.8" y="549" width="1.4" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="840.79" y="559.5" ></text>
+</g>
+<g >
+<title>PQsocket (3,003,003 samples, 0.02%)</title><rect x="447.4" y="501" width="0.3" height="15.0" fill="rgb(231,119,28)" rx="2" ry="2" />
+<text  x="450.43" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,091,091,089 samples, 15.81%)</title><rect x="966.1" y="261" width="186.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="969.06" y="271.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQgetResult@plt (4,004,004 samples, 0.03%)</title><rect x="37.2" y="549" width="0.4" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="40.24" y="559.5" ></text>
+</g>
+<g >
+<title>PQgetResult (19,019,019 samples, 0.14%)</title><rect x="35.5" y="549" width="1.7" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="38.55" y="559.5" ></text>
+</g>
+<g >
+<title>PQenterPipelineMode (8,008,008 samples, 0.06%)</title><rect x="444.3" y="501" width="0.7" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="447.30" y="511.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::drain (245,245,245 samples, 1.85%)</title><rect x="435.1" y="533" width="21.9" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="438.10" y="543.5" >i..</text>
+</g>
+<g >
+<title>__GI___pthread_enable_asynccancel (8,008,008 samples, 0.06%)</title><rect x="289.9" y="533" width="0.8" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="292.95" y="543.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_start_on_slot (5,005,005 samples, 0.04%)</title><rect x="434.7" y="517" width="0.4" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="437.66" y="527.5" ></text>
+</g>
+<g >
+<title>__strlen_evex (132,132,132 samples, 1.00%)</title><rect x="745.4" y="549" width="11.8" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="748.42" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,233,233,231 samples, 16.89%)</title><rect x="953.4" y="309" width="199.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="956.37" y="319.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,030,030,029 samples, 7.79%)</title><rect x="337.3" y="309" width="91.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="340.29" y="319.5" >[[kernel.k..</text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::worker_loop (2,451,451,449 samples, 18.54%)</title><rect x="239.1" y="549" width="218.8" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="242.12" y="559.5" >iris::net::(anonymous namesp..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,354,354,352 samples, 17.80%)</title><rect x="942.6" y="341" width="210.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="945.57" y="351.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,482,482,481 samples, 11.21%)</title><rect x="296.9" y="453" width="132.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="299.92" y="463.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,646,646,645 samples, 12.45%)</title><rect x="91.4" y="517" width="146.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="94.38" y="527.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[libpq.so.private15-5.15] (1,137,137,136 samples, 8.60%)</title><rect x="516.1" y="533" width="101.5" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="519.12" y="543.5" >[libpq.so.pr..</text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_arm_flush (7,007,007 samples, 0.05%)</title><rect x="432.2" y="533" width="0.6" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="435.16" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (625,625,625 samples, 4.73%)</title><rect x="624.5" y="485" width="55.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="627.48" y="495.5" >[[ker..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (936,936,936 samples, 7.09%)</title><rect x="345.6" y="229" width="83.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="348.60" y="239.5" >[[kernel...</text>
+</g>
+<g >
+<title>PQpipelineSync (5,005,005 samples, 0.04%)</title><rect x="445.1" y="501" width="0.5" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="448.11" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (226,226,226 samples, 1.71%)</title><rect x="61.4" y="485" width="20.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="64.36" y="495.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (487,487,487 samples, 3.69%)</title><rect x="636.8" y="421" width="43.5" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="639.80" y="431.5" >[[ke..</text>
+</g>
+<g >
+<title>__GI___pthread_disable_asynccancel (7,007,007 samples, 0.05%)</title><rect x="617.7" y="533" width="0.6" height="15.0" fill="rgb(236,146,34)" rx="2" ry="2" />
+<text  x="620.69" y="543.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (26,026,026 samples, 0.20%)</title><rect x="459.8" y="549" width="2.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="462.76" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (216,216,216 samples, 1.64%)</title><rect x="62.3" y="469" width="19.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="65.26" y="479.5" ></text>
+</g>
+<g >
+<title>__vsnprintf_internal (11,011,011 samples, 0.08%)</title><rect x="82.6" y="549" width="1.0" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="85.62" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,435,435,434 samples, 10.86%)</title><rect x="301.1" y="421" width="128.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="304.11" y="431.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>[unknown] (4,269,269,265 samples, 32.29%)</title><rect x="458.2" y="565" width="381.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="461.24" y="575.5" >[unknown]</text>
+</g>
+<g >
+<title>malloc (18,018,018 samples, 0.14%)</title><rect x="701.6" y="533" width="1.6" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="704.56" y="543.5" ></text>
+</g>
+<g >
+<title>__vsnprintf_internal (18,018,018 samples, 0.14%)</title><rect x="449.9" y="501" width="1.6" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="452.93" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (168,168,168 samples, 1.27%)</title><rect x="665.3" y="373" width="15.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="668.30" y="383.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="197" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="207.5" ></text>
+</g>
+<g >
+<title>appendBinaryPQExpBuffer (51,051,051 samples, 0.39%)</title><rect x="690.8" y="533" width="4.5" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="693.76" y="543.5" ></text>
+</g>
+<g >
+<title>PQgetvalue@plt (3,003,003 samples, 0.02%)</title><rect x="41.4" y="549" width="0.3" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="44.44" y="559.5" ></text>
+</g>
+<g >
+<title>PQsendQueryPrepared (18,018,018 samples, 0.14%)</title><rect x="445.6" y="501" width="1.6" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="448.55" y="511.5" ></text>
+</g>
+<g >
+<title>PQsendQueryPrepared@plt (3,003,003 samples, 0.02%)</title><rect x="447.2" y="501" width="0.2" height="15.0" fill="rgb(247,195,46)" rx="2" ry="2" />
+<text  x="450.16" y="511.5" ></text>
+</g>
+<g >
+<title>PQsendQueryPrepared (20,020,020 samples, 0.15%)</title><rect x="514.3" y="533" width="1.8" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="517.34" y="543.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::drain (3,003,003 samples, 0.02%)</title><rect x="238.6" y="549" width="0.3" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="241.59" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (739,739,739 samples, 5.59%)</title><rect x="363.2" y="101" width="66.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="366.20" y="111.5" >[[kerne..</text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_start_on_slot (49,049,049 samples, 0.37%)</title><rect x="452.3" y="501" width="4.3" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="455.25" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,001,001,000 samples, 7.57%)</title><rect x="339.9" y="293" width="89.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="342.88" y="303.5" >[[kernel.k..</text>
+</g>
+<g >
+<title>__vsnprintf_internal (54,054,054 samples, 0.41%)</title><rect x="808.0" y="549" width="4.9" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="811.04" y="559.5" ></text>
+</g>
+<g >
+<title>__memmove_evex_unaligned_erms (57,057,057 samples, 0.43%)</title><rect x="853.2" y="565" width="5.1" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="856.24" y="575.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_release (26,026,026 samples, 0.20%)</title><rect x="432.8" y="533" width="2.3" height="15.0" fill="rgb(238,154,36)" rx="2" ry="2" />
+<text  x="435.78" y="543.5" ></text>
+</g>
+<g >
+<title>alloc_perturb (6,006,006 samples, 0.05%)</title><rect x="690.2" y="533" width="0.6" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="693.22" y="543.5" ></text>
+</g>
+<g >
+<title>PQsendQueryPrepared (2,002,002 samples, 0.02%)</title><rect x="433.7" y="517" width="0.2" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="436.67" y="527.5" ></text>
+</g>
+<g >
+<title>PQstatus (4,004,004 samples, 0.03%)</title><rect x="48.1" y="549" width="0.3" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="51.05" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="325" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="335.5" ></text>
+</g>
+<g >
+<title>PQflush (2,002,002 samples, 0.02%)</title><rect x="289.4" y="533" width="0.2" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="292.41" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (2,259,259,257 samples, 17.09%)</title><rect x="503.2" y="549" width="201.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="506.17" y="559.5" >[unknown]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (883,883,883 samples, 6.68%)</title><rect x="350.3" y="165" width="78.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="353.33" y="175.5" >[[kernel...</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,961,961,959 samples, 22.40%)</title><rect x="888.3" y="421" width="264.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="891.35" y="431.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>iris::net::AsyncCtx::run_db (154,154,154 samples, 1.17%)</title><rect x="443.0" y="517" width="13.7" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="445.96" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,802,802,801 samples, 13.63%)</title><rect x="991.8" y="165" width="160.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="994.79" y="175.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (903,903,903 samples, 6.84%)</title><rect x="348.5" y="197" width="80.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="351.55" y="207.5" >[[kernel...</text>
+</g>
+<g >
+<title>_int_malloc (37,037,037 samples, 0.28%)</title><rect x="686.9" y="533" width="3.3" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="689.91" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (970,970,970 samples, 7.34%)</title><rect x="342.6" y="261" width="86.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="345.56" y="271.5" >[[kernel.k..</text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (14,014,014 samples, 0.11%)</title><rect x="836.5" y="549" width="1.3" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="839.54" y="559.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_disable_asynccancel (3,003,003 samples, 0.02%)</title><rect x="289.7" y="533" width="0.2" height="15.0" fill="rgb(236,146,34)" rx="2" ry="2" />
+<text  x="292.68" y="543.5" ></text>
+</g>
+<g >
+<title>[libpq.so.private15-5.15] (50,050,050 samples, 0.38%)</title><rect x="48.4" y="549" width="4.5" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="51.41" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,846,846,844 samples, 21.53%)</title><rect x="898.6" y="405" width="254.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="901.62" y="415.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,136,136,133 samples, 23.72%)</title><rect x="872.8" y="453" width="279.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="875.80" y="463.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,063,063,061 samples, 15.60%)</title><rect x="968.6" y="245" width="184.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="971.56" y="255.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>_IO_default_xsputn (110,110,110 samples, 0.83%)</title><rect x="704.8" y="549" width="9.8" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="707.78" y="559.5" ></text>
+</g>
+<g >
+<title>resetPQExpBuffer (18,018,018 samples, 0.14%)</title><rect x="703.2" y="533" width="1.6" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="706.17" y="543.5" ></text>
+</g>
+<g >
+<title>__vsnprintf_internal (2,002,002 samples, 0.02%)</title><rect x="686.2" y="533" width="0.2" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="689.20" y="543.5" ></text>
+</g>
+<g >
+<title>PQexitPipelineMode (2,002,002 samples, 0.02%)</title><rect x="35.4" y="549" width="0.1" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="38.37" y="559.5" ></text>
+</g>
+<g >
+<title>PQconsumeInput (19,019,019 samples, 0.14%)</title><rect x="33.6" y="549" width="1.7" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="36.58" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,329,329,328 samples, 10.05%)</title><rect x="310.6" y="405" width="118.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="313.58" y="415.5" >[[kernel.kalls..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,523,523,522 samples, 11.52%)</title><rect x="293.3" y="501" width="135.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="296.25" y="511.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,258,258,255 samples, 24.64%)</title><rect x="861.9" y="533" width="290.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="864.90" y="543.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQexitPipelineMode (2,002,002 samples, 0.02%)</title><rect x="503.7" y="533" width="0.2" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="506.71" y="543.5" ></text>
+</g>
+<g >
+<title>PQresultStatus (22,022,022 samples, 0.17%)</title><rect x="45.2" y="549" width="2.0" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="48.19" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,477,477,476 samples, 11.17%)</title><rect x="106.5" y="453" width="131.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="109.47" y="463.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>epoll_wait (1,719,719,718 samples, 13.01%)</title><rect x="84.9" y="549" width="153.5" height="15.0" fill="rgb(238,154,36)" rx="2" ry="2" />
+<text  x="87.94" y="559.5" >epoll_wait</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,519,519,518 samples, 11.49%)</title><rect x="293.6" y="485" width="135.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="296.61" y="495.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQgetvalue (43,043,043 samples, 0.33%)</title><rect x="37.6" y="549" width="3.8" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="40.60" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,424,424,422 samples, 18.33%)</title><rect x="936.3" y="357" width="216.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="939.31" y="367.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.33] (4,778,778,774 samples, 36.14%)</title><rect x="31.8" y="565" width="426.4" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="34.80" y="575.5" >[libstdc++.so.6.0.33]</text>
+</g>
+<g >
+<title>__strchrnul_evex (114,114,114 samples, 0.86%)</title><rect x="729.5" y="549" width="10.2" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="732.52" y="559.5" ></text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_start_on_slot (3,003,003 samples, 0.02%)</title><rect x="442.7" y="517" width="0.3" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="445.70" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (685,685,685 samples, 5.19%)</title><rect x="368.0" y="85" width="61.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="371.02" y="95.5" >[[kern..</text>
+</g>
+<g >
+<title>PQmakeEmptyPGresult (60,060,060 samples, 0.45%)</title><rect x="508.4" y="533" width="5.3" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="511.35" y="543.5" ></text>
+</g>
+<g >
+<title>[libpq.so.private15-5.15] (460,460,460 samples, 3.48%)</title><rect x="462.1" y="549" width="41.1" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="465.08" y="559.5" >[li..</text>
+</g>
+<g >
+<title>__vfprintf_internal (2,002,002 samples, 0.02%)</title><rect x="686.0" y="533" width="0.2" height="15.0" fill="rgb(232,125,30)" rx="2" ry="2" />
+<text  x="689.02" y="543.5" ></text>
+</g>
+<g >
+<title>_IO_no_init (32,032,032 samples, 0.24%)</title><rect x="714.6" y="549" width="2.9" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="717.61" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,021,021,018 samples, 22.85%)</title><rect x="883.1" y="437" width="269.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="886.07" y="447.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,189,189,187 samples, 16.56%)</title><rect x="957.3" y="293" width="195.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="960.31" y="303.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,442,442,441 samples, 10.91%)</title><rect x="1023.9" y="101" width="128.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1026.94" y="111.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,248,248,245 samples, 24.56%)</title><rect x="862.8" y="517" width="289.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="865.80" y="527.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,694,694,693 samples, 12.82%)</title><rect x="1001.4" y="133" width="151.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1004.43" y="143.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,276,276,274 samples, 17.21%)</title><rect x="949.5" y="325" width="203.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="952.53" y="335.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>__strdup (12,012,012 samples, 0.09%)</title><rect x="684.4" y="533" width="1.1" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="687.41" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (626,626,626 samples, 4.74%)</title><rect x="624.4" y="501" width="55.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="627.39" y="511.5" >[[ker..</text>
+</g>
+<g >
+<title>__GI___pthread_disable_asynccancel (27,027,027 samples, 0.20%)</title><rect x="52.9" y="549" width="2.4" height="15.0" fill="rgb(236,146,34)" rx="2" ry="2" />
+<text  x="55.88" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,646,646,645 samples, 12.45%)</title><rect x="91.4" y="533" width="146.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="94.38" y="543.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (773,773,773 samples, 5.85%)</title><rect x="360.2" y="117" width="69.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="363.16" y="127.5" >[[kerne..</text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_arm_flush (2,002,002 samples, 0.02%)</title><rect x="442.5" y="517" width="0.2" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="445.52" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (268,268,268 samples, 2.03%)</title><rect x="57.6" y="517" width="24.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="60.61" y="527.5" >[..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (193,193,193 samples, 1.46%)</title><rect x="64.3" y="437" width="17.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="67.31" y="447.5" ></text>
+</g>
+<g >
+<title>__memmove_evex_unaligned_erms (12,012,012 samples, 0.09%)</title><rect x="290.7" y="533" width="1.0" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="293.66" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,954,954,953 samples, 14.78%)</title><rect x="978.2" y="213" width="174.5" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="981.21" y="223.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>_itoa_word (132,132,132 samples, 1.00%)</title><rect x="824.7" y="549" width="11.8" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="827.74" y="559.5" ></text>
+</g>
+<g >
+<title>[unknown] (7,007,007 samples, 0.05%)</title><rect x="1152.7" y="549" width="0.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1155.66" y="559.5" ></text>
+</g>
+<g >
+<title>PQresultStatus@plt (10,010,010 samples, 0.08%)</title><rect x="47.2" y="549" width="0.9" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="50.16" y="559.5" ></text>
+</g>
+<g >
+<title>_IO_old_init (44,044,044 samples, 0.33%)</title><rect x="717.5" y="549" width="3.9" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="720.46" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,594,594,593 samples, 12.06%)</title><rect x="96.0" y="485" width="142.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="99.02" y="495.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQflush (3,003,003 samples, 0.02%)</title><rect x="503.9" y="533" width="0.3" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="506.88" y="543.5" ></text>
+</g>
+<g >
+<title>[libpq.so.private15-5.15] (244,244,244 samples, 1.85%)</title><rect x="10.0" y="565" width="21.8" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" >[..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,928,928,927 samples, 14.59%)</title><rect x="980.5" y="197" width="172.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="983.53" y="207.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="229" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="239.5" ></text>
+</g>
+<g >
+<title>PQconsumeInput (6,006,006 samples, 0.05%)</title><rect x="503.2" y="533" width="0.5" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="506.17" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="309" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="319.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,253,253,252 samples, 9.48%)</title><rect x="317.4" y="373" width="111.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="320.37" y="383.5" >[[kernel.kall..</text>
+</g>
+<g >
+<title>__vfprintf_internal (569,569,569 samples, 4.31%)</title><rect x="757.2" y="549" width="50.8" height="15.0" fill="rgb(232,125,30)" rx="2" ry="2" />
+<text  x="760.21" y="559.5" >__vfp..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (135,135,135 samples, 1.02%)</title><rect x="668.2" y="357" width="12.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="671.25" y="367.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,063,063,062 samples, 8.04%)</title><rect x="334.3" y="325" width="94.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="337.34" y="335.5" >[[kernel.ka..</text>
+</g>
+<g >
+<title>_int_malloc (37,037,037 samples, 0.28%)</title><rect x="1157.4" y="565" width="3.3" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="1160.40" y="575.5" ></text>
+</g>
+<g >
+<title>PQclear (17,017,017 samples, 0.13%)</title><rect x="458.2" y="549" width="1.6" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="461.24" y="559.5" ></text>
+</g>
+<g >
+<title>all (13,223,223,210 samples, 100%)</title><rect x="10.0" y="597" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (837,837,837 samples, 6.34%)</title><rect x="354.4" y="133" width="74.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="357.44" y="143.5" >[[kernel..</text>
+</g>
+<g >
+<title>enlargePQExpBuffer (61,061,061 samples, 0.46%)</title><rect x="696.1" y="533" width="5.5" height="15.0" fill="rgb(248,200,48)" rx="2" ry="2" />
+<text  x="699.12" y="543.5" ></text>
+</g>
+<g >
+<title>memchr@plt (2,002,002 samples, 0.02%)</title><rect x="456.7" y="517" width="0.2" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="459.72" y="527.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (210,210,210 samples, 1.59%)</title><rect x="62.8" y="453" width="18.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="65.79" y="463.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="213" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="223.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (272,272,272 samples, 2.06%)</title><rect x="656.0" y="389" width="24.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="659.01" y="399.5" >[..</text>
+</g>
+<g >
+<title>_IO_setb (7,007,007 samples, 0.05%)</title><rect x="721.4" y="549" width="0.6" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="724.39" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (19,019,019 samples, 0.14%)</title><rect x="427.5" y="37" width="1.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="430.51" y="47.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,493,493,492 samples, 11.29%)</title><rect x="295.9" y="469" width="133.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="298.93" y="479.5" >[[kernel.kallsym..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (535,535,535 samples, 4.05%)</title><rect x="632.5" y="437" width="47.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="635.51" y="447.5" >[[ke..</text>
+</g>
+<g >
+<title>__errno_location (3,003,003 samples, 0.02%)</title><rect x="853.0" y="565" width="0.2" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="855.97" y="575.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,159,159,156 samples, 23.89%)</title><rect x="870.7" y="469" width="282.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="873.75" y="479.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,513,513,511 samples, 19.01%)</title><rect x="928.4" y="373" width="224.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="931.36" y="383.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (951,951,951 samples, 7.20%)</title><rect x="344.3" y="245" width="84.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="347.26" y="255.5" >[[kernel...</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (38,038,038 samples, 0.29%)</title><rect x="676.9" y="341" width="3.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="679.91" y="351.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,190,190,187 samples, 24.13%)</title><rect x="868.0" y="501" width="284.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="870.98" y="511.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>_int_free (6,006,006 samples, 0.05%)</title><rect x="686.4" y="533" width="0.5" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="689.38" y="543.5" ></text>
+</g>
+<g >
+<title>_int_free (46,046,046 samples, 0.35%)</title><rect x="1153.3" y="565" width="4.1" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="1156.29" y="575.5" ></text>
+</g>
+<g >
+<title>snprintf@plt (3,003,003 samples, 0.02%)</title><rect x="458.0" y="549" width="0.2" height="15.0" fill="rgb(219,64,15)" rx="2" ry="2" />
+<text  x="460.97" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,731,731,730 samples, 13.10%)</title><rect x="998.1" y="149" width="154.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1001.13" y="159.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQntuples (4,004,004 samples, 0.03%)</title><rect x="44.6" y="549" width="0.3" height="15.0" fill="rgb(241,166,39)" rx="2" ry="2" />
+<text  x="47.57" y="559.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (54,054,054 samples, 0.41%)</title><rect x="1161.7" y="565" width="4.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="1164.68" y="575.5" ></text>
+</g>
+<g >
+<title>_IO_setb (19,019,019 samples, 0.14%)</title><rect x="849.3" y="565" width="1.7" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="852.31" y="575.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_disable_asynccancel (12,012,012 samples, 0.09%)</title><rect x="851.0" y="565" width="1.1" height="15.0" fill="rgb(236,146,34)" rx="2" ry="2" />
+<text  x="854.01" y="575.5" ></text>
+</g>
+<g >
+<title>__send (3,305,305,302 samples, 25.00%)</title><rect x="858.3" y="565" width="295.0" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="861.33" y="575.5" >__send</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (3,173,173,170 samples, 24.00%)</title><rect x="869.5" y="485" width="283.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="872.50" y="495.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>__memchr_evex (15,015,015 samples, 0.11%)</title><rect x="437.1" y="517" width="1.3" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="440.07" y="527.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_enable_asynccancel (10,010,010 samples, 0.08%)</title><rect x="618.3" y="533" width="0.9" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="621.31" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,279,279,278 samples, 9.67%)</title><rect x="124.2" y="421" width="114.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="127.16" y="431.5" >[[kernel.kalls..</text>
+</g>
+<g >
+<title>__strlen_evex (6,006,006 samples, 0.05%)</title><rect x="685.5" y="533" width="0.5" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="688.49" y="543.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (2,002,002 samples, 0.02%)</title><rect x="81.4" y="293" width="0.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="84.37" y="303.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (982,982,982 samples, 7.43%)</title><rect x="341.5" y="277" width="87.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="344.49" y="287.5" >[[kernel.k..</text>
+</g>
+<g >
+<title>resetPQExpBuffer (36,036,036 samples, 0.27%)</title><rect x="1186.8" y="565" width="3.2" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="1189.78" y="575.5" ></text>
+</g>
+<g >
+<title>__strcpy_evex (64,064,064 samples, 0.48%)</title><rect x="739.7" y="549" width="5.7" height="15.0" fill="rgb(206,8,1)" rx="2" ry="2" />
+<text  x="742.71" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,575,575,574 samples, 11.92%)</title><rect x="97.7" y="469" width="140.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="100.72" y="479.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (355,355,355 samples, 2.69%)</title><rect x="648.6" y="405" width="31.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="651.59" y="415.5" >[[..</text>
+</g>
+<g >
+<title>__snprintf (25,025,025 samples, 0.19%)</title><rect x="447.7" y="501" width="2.2" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="450.70" y="511.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (626,626,626 samples, 4.74%)</title><rect x="624.4" y="517" width="55.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="627.39" y="527.5" >[[ker..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,292,292,291 samples, 9.77%)</title><rect x="313.9" y="389" width="115.3" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="316.89" y="399.5" >[[kernel.kalls..</text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,871,871,870 samples, 14.16%)</title><rect x="985.6" y="181" width="167.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="988.62" y="191.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>iris::net::(anonymous namespace)::db_arm_flush (2,002,002 samples, 0.02%)</title><rect x="238.4" y="549" width="0.2" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="241.41" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (1,577,577,576 samples, 11.93%)</title><rect x="1011.9" y="117" width="140.8" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1014.88" y="127.5" >[[kernel.kallsyms]]</text>
+</g>
+<g >
+<title>PQisBusy (30,030,030 samples, 0.23%)</title><rect x="41.7" y="549" width="2.7" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="44.71" y="559.5" ></text>
+</g>
+<g >
+<title>PQclear (12,012,012 samples, 0.09%)</title><rect x="32.4" y="549" width="1.1" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="35.42" y="559.5" ></text>
+</g>
+<g >
+<title>[[kernel.kallsyms]] (124,124,124 samples, 0.94%)</title><rect x="70.5" y="421" width="11.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="73.47" y="431.5" ></text>
+</g>
+</g>
+</svg>

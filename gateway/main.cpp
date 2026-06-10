@@ -15,6 +15,7 @@
 // are templated while the body is re-serialized each request by a real JSON
 // serializer, honoring the TFB rule that the object be serialized per request.
 // =============================================================================
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,9 @@ namespace {
 
 using iris::http::Buffer;
 using iris::http::Request;
+using iris::net::AsyncCtx;
+using iris::net::DbRoute;
+using iris::net::Outcome;
 
 constexpr std::string_view kHelloPlain = "Hello, World!";
 constexpr std::string_view kHelloMsg   = "Hello, World!";
@@ -157,6 +161,75 @@ inline void emit_template(Buffer& out, const RespTemplate& t) noexcept {
     }
 }
 
+// ---- DB body formatters (called by the server core after assembling headers)-
+// These write only the response body. The World-row shape is the same JSON
+// object the /json route uses, so the field-by-field serializer is reused.
+
+void fmt_world_one(Buffer& out, std::int32_t id, std::int32_t rn) noexcept {
+    out.append("{\"id\":");
+    out.append_uint(static_cast<std::size_t>(id));
+    out.append(",\"randomNumber\":");
+    out.append_uint(static_cast<std::size_t>(rn));
+    out.append('}');
+}
+
+void fmt_world_many(Buffer& out, const std::int32_t* ids, const std::int32_t* rns,
+                    int n) noexcept {
+    out.append('[');
+    for (int i = 0; i < n; ++i) {
+        if (i) out.append(',');
+        fmt_world_one(out, ids[i], rns[i]);
+    }
+    out.append(']');
+}
+
+// HTML-escape into the body. Escaping &, <, > is structurally required;
+// escaping " and ' matches the canonical TFB fortunes output. Multi-byte UTF-8
+// (em dash, the Japanese fortune) passes through unchanged.
+void html_escape(Buffer& out, std::string_view s) noexcept {
+    for (char c : s) {
+        switch (c) {
+            case '&':  out.append("&amp;");  break;
+            case '<':  out.append("&lt;");   break;
+            case '>':  out.append("&gt;");   break;
+            case '"':  out.append("&quot;"); break;
+            case '\'': out.append("&#39;");  break;
+            default:   out.append(c);
+        }
+    }
+}
+
+// /fortunes: the DB rows plus one row added at request time, sorted by message,
+// rendered as the TFB HTML table. `rows[i].message` points into the live
+// PGresult, valid for the duration of this call (see db_pump in server.cpp).
+void fmt_fortunes(Buffer& out, const iris::net::FortuneRow* rows, int n) noexcept {
+    struct R { std::int32_t id; std::string_view msg; };
+    R arr[64];
+    int m = 0;
+    for (int i = 0; i < n && m < 63; ++i, ++m) {
+        arr[m].id  = rows[i].id;
+        arr[m].msg = rows[i].message;
+    }
+    // The extra fortune required by the spec, inserted before sorting.
+    arr[m].id  = 0;
+    arr[m].msg = "Additional fortune added at request time.";
+    ++m;
+
+    std::sort(arr, arr + m,
+              [](const R& a, const R& b) { return a.msg < b.msg; });
+
+    out.append("<!DOCTYPE html><html><head><title>Fortunes</title></head><body>"
+               "<table><tr><th>id</th><th>message</th></tr>");
+    for (int i = 0; i < m; ++i) {
+        out.append("<tr><td>");
+        out.append_uint(static_cast<std::size_t>(arr[i].id));
+        out.append("</td><td>");
+        html_escape(out, arr[i].msg);
+        out.append("</td></tr>");
+    }
+    out.append("</table></body></html>");
+}
+
 // The templated fast path is a pure HTTP/1.1 keep-alive response (no Connection
 // header). It is taken only for HTTP/1.1 keep-alive traffic, which is ~100% of
 // TFB load (wrk speaks 1.1). HTTP/1.0 and Connection: close fall back to the
@@ -165,7 +238,34 @@ inline bool fast_path(const Request& req) noexcept {
     return req.keep_alive && req.minor_version >= 1;
 }
 
-void handle(const Request& req, Buffer& out) {
+// Path matches `route` exactly or `route?...` (query string allowed).
+inline bool route_is(std::string_view path, std::string_view route) noexcept {
+    return path == route ||
+           (path.size() > route.size() && path.compare(0, route.size(), route) == 0 &&
+            path[route.size()] == '?');
+}
+
+// TFB `queries`/`updates` count: read the `queries` query-string parameter,
+// clamp to [1,500]; anything missing or non-numeric becomes 1 (per TFB rules).
+int parse_query_count(std::string_view path) noexcept {
+    const auto q = path.find("queries=");
+    if (q == std::string_view::npos) return 1;
+    std::size_t i = q + 8;
+    long n = 0;
+    bool any = false;
+    while (i < path.size() && path[i] >= '0' && path[i] <= '9') {
+        n = n * 10 + (path[i] - '0');
+        any = true;
+        if (n > 1000) break;  // saturate; avoids overflow on absurd input
+        ++i;
+    }
+    if (!any) return 1;
+    if (n < 1) return 1;
+    if (n > 500) return 500;
+    return static_cast<int>(n);
+}
+
+Outcome handle(const Request& req, Buffer& out, AsyncCtx& ctx) {
     if (req.path == "/plaintext") {
         if (fast_path(req)) {
             emit_template(out, g_plain);
@@ -173,7 +273,7 @@ void handle(const Request& req, Buffer& out) {
             iris::http::write_response(out, 200, "OK", "text/plain", kHelloPlain,
                                        req.minor_version, req.keep_alive);
         }
-        return;
+        return Outcome::kResponded;
     }
     if (req.path == "/json") {
         if (fast_path(req)) {
@@ -186,16 +286,48 @@ void handle(const Request& req, Buffer& out) {
             iris::http::write_response(out, 200, "OK", "application/json",
                                        body.view(), req.minor_version, req.keep_alive);
         }
-        return;
+        return Outcome::kResponded;
+    }
+    if (req.path == "/db") {
+        if (ctx.run_db(DbRoute::kWorldOne, 1)) return Outcome::kSuspended;
+        iris::http::write_response(out, 503, "Service Unavailable", "text/plain",
+                                   "db unavailable", req.minor_version, false);
+        return Outcome::kResponded;
+    }
+    if (route_is(req.path, "/queries")) {
+        if (ctx.run_db(DbRoute::kWorldMany, parse_query_count(req.path)))
+            return Outcome::kSuspended;
+        iris::http::write_response(out, 503, "Service Unavailable", "text/plain",
+                                   "db unavailable", req.minor_version, false);
+        return Outcome::kResponded;
+    }
+    if (route_is(req.path, "/updates")) {
+        if (ctx.run_db(DbRoute::kWorldUpdate, parse_query_count(req.path)))
+            return Outcome::kSuspended;
+        iris::http::write_response(out, 503, "Service Unavailable", "text/plain",
+                                   "db unavailable", req.minor_version, false);
+        return Outcome::kResponded;
+    }
+    if (req.path == "/fortunes") {
+        if (ctx.run_db(DbRoute::kFortunes, 0)) return Outcome::kSuspended;
+        iris::http::write_response(out, 503, "Service Unavailable", "text/plain",
+                                   "db unavailable", req.minor_version, false);
+        return Outcome::kResponded;
     }
     iris::http::write_response(out, 404, "Not Found", "text/plain", "",
                                req.minor_version, req.keep_alive);
+    return Outcome::kResponded;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     iris::net::ServerConfig cfg;
+
+    // DB connection string: --db "<conninfo>" or the IRIS_DB env var. When unset
+    // the DB routes report 503; /plaintext and /json run unchanged.
+    const char* db_conninfo = std::getenv("IRIS_DB");
+    int         db_pool     = 8;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -204,11 +336,29 @@ int main(int argc, char** argv) {
             cfg.workers = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-pin") == 0) {
             cfg.pin_threads = false;
+        } else if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
+            db_conninfo = argv[++i];
+        } else if (std::strcmp(argv[i], "--db-pool") == 0 && i + 1 < argc) {
+            db_pool = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0) {
-            std::printf("usage: iris-gw [--port N] [--workers N] [--no-pin]\n");
+            std::printf("usage: iris-gw [--port N] [--workers N] [--no-pin]"
+                        " [--db CONNINFO] [--db-pool N]\n");
             return 0;
         }
     }
+
+#if defined(IRIS_HAVE_LIBPQ)
+    if (db_conninfo != nullptr) {
+        cfg.db.conninfo        = db_conninfo;
+        cfg.db.pool_per_worker = db_pool > 0 ? db_pool : 1;
+        cfg.db.fmt.world_one   = fmt_world_one;
+        cfg.db.fmt.world_many  = fmt_world_many;
+        cfg.db.fmt.fortunes    = fmt_fortunes;
+    }
+#else
+    (void)db_conninfo;
+    (void)db_pool;
+#endif
 
     iris::http::start_date_clock();
     g_plain = build_template("text/plain", kHelloPlain.size(), kHelloPlain, true);
@@ -237,6 +387,14 @@ int main(int argc, char** argv) {
                 static_cast<unsigned>(cfg.port),
                 workers ? std::to_string(workers).c_str() : "auto",
                 static_cast<int>(cfg.reuseport));
+#if defined(IRIS_HAVE_LIBPQ)
+    if (cfg.db.conninfo != nullptr) {
+        std::printf("[iris-gw] DB enabled: pool=%d per worker\n",
+                    cfg.db.pool_per_worker);
+    } else {
+        std::printf("[iris-gw] DB disabled (set IRIS_DB or --db to enable)\n");
+    }
+#endif
     std::fflush(stdout);
 
     return iris::net::run_server(cfg, handle);

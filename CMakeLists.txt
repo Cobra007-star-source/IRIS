@@ -54,6 +54,7 @@ option(IRIS_BUILD_SIMDJSON   "Fetch and link simdjson for cross-comparison" ON)
 option(IRIS_BUILD_BOWTIE     "Build Bowtie protocol harness" ON)
 option(IRIS_ENABLE_JIT       "Enable JIT code generation"   OFF)
 option(IRIS_BUILD_GATEWAY    "Build the IRIS HTTP gateway (TechEmpower target)" ON)
+option(IRIS_BUILD_DB         "Build async PostgreSQL DB routes (needs libpq)" ON)
 
 # Deployment profile for the gateway: "racing" (epoll/SO_REUSEPORT/pinned, max
 # throughput) or "production" (portable, conservative defaults).
