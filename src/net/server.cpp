@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+    #include <linux/filter.h>
     #include <pthread.h>
     #include <sched.h>
 #endif
@@ -1251,6 +1252,33 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
 #endif
         ws.push_back(w);
     }
+
+#if defined(__linux__) && defined(SO_ATTACH_REUSEPORT_CBPF)
+    // Steer each incoming connection to the listener whose index matches the
+    // CPU that handled the SYN (cpu % workers). With workers pinned to CPU i,
+    // a connection is served on the core that already owns its RX queue --
+    // aligning SO_REUSEPORT with RSS/IRQ steering instead of the default
+    // 4-tuple hash. Attached once: the program applies to the whole group.
+    if (reuseport && workers > 1 && cfg.pin_threads) {
+        struct sock_filter code[] = {
+            {BPF_LD | BPF_W | BPF_ABS, 0, 0,
+             static_cast<std::uint32_t>(SKF_AD_OFF + SKF_AD_CPU)},
+            {BPF_ALU | BPF_MOD | BPF_K, 0, 0,
+             static_cast<std::uint32_t>(workers)},
+            {BPF_RET | BPF_A, 0, 0, 0},
+        };
+        struct sock_fprog prog = {3, code};
+        if (::setsockopt(ws.back()->listener, SOL_SOCKET,
+                         SO_ATTACH_REUSEPORT_CBPF, &prog, sizeof(prog)) == 0) {
+            std::printf("[iris-gw] reuseport CBPF: cpu-affine steering (%d)\n",
+                        workers);
+        } else {
+            std::fprintf(stderr, "[iris-gw] reuseport CBPF unavailable (%s); "
+                         "kernel hash steering kept\n", std::strerror(errno));
+        }
+        std::fflush(stdout);
+    }
+#endif
 
     for (int i = 0; i < workers; ++i) {
         threads.emplace_back(worker_loop, ws[i], i, cfg.pin_threads);
