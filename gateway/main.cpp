@@ -28,6 +28,12 @@
 #include "iris/http/response.hpp"
 #include "iris/net/server.hpp"
 
+#if defined(IRIS_HAVE_LIBPQ)
+    #include "iris/db/pg.hpp"
+
+    #include <chrono>
+#endif
+
 #if defined(IRIS_HAVE_ASMJIT)
     #include "iris/jit/serializer.hpp"
 #endif
@@ -245,12 +251,13 @@ inline bool route_is(std::string_view path, std::string_view route) noexcept {
             path[route.size()] == '?');
 }
 
-// TFB `queries`/`updates` count: read the `queries` query-string parameter,
-// clamp to [1,500]; anything missing or non-numeric becomes 1 (per TFB rules).
-int parse_query_count(std::string_view path) noexcept {
-    const auto q = path.find("queries=");
+// TFB fan-out count: read the `key` query-string parameter ("queries=" for
+// /queries and /updates, "count=" for /cached-queries), clamp to [1,500];
+// anything missing or non-numeric becomes 1 (per TFB rules).
+int parse_count_param(std::string_view path, std::string_view key) noexcept {
+    const auto q = path.find(key);
     if (q == std::string_view::npos) return 1;
-    std::size_t i = q + 8;
+    std::size_t i = q + key.size();
     long n = 0;
     bool any = false;
     while (i < path.size() && path[i] >= '0' && path[i] <= '9') {
@@ -264,6 +271,49 @@ int parse_query_count(std::string_view path) noexcept {
     if (n > 500) return 500;
     return static_cast<int>(n);
 }
+
+inline int parse_query_count(std::string_view path) noexcept {
+    return parse_count_param(path, "queries=");
+}
+
+#if defined(IRIS_HAVE_LIBPQ)
+// ---- /cached-queries: in-process World cache ----------------------------------
+// TFB's caching test reads the CachedWorld table through an application-level
+// cache. The table is immutable for the duration of a run, so the cache is a
+// flat array indexed by id-1, loaded once at startup (cold path) and read
+// lock-free by every worker afterwards.
+constexpr int kCachedRows = 10000;
+std::int32_t  g_world_cache[kCachedRows];
+bool          g_cache_ready = false;
+
+// Gateway-local PRNG for cached ids (the server core owns its own for the DB
+// routes; this route never reaches the core).
+inline std::uint32_t cq_rng() noexcept {
+    static thread_local std::uint64_t s =
+        static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()) ^
+        (reinterpret_cast<std::uint64_t>(&s) * 0x9E3779B97F4A7C15ull);
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return static_cast<std::uint32_t>(s);
+}
+
+// Build the JSON array straight from the cache. Same body shape as /queries.
+void handle_cached_queries(const Request& req, Buffer& out) noexcept {
+    const int n = parse_count_param(req.path, "count=");
+    std::int32_t ids[500], rns[500];
+    for (int i = 0; i < n; ++i) {
+        ids[i] = 1 + static_cast<std::int32_t>(cq_rng() % kCachedRows);
+        rns[i] = g_world_cache[ids[i] - 1];
+    }
+    thread_local char scratch[24576];
+    Buffer body(scratch, sizeof(scratch));
+    fmt_world_many(body, ids, rns, n);
+    iris::http::write_response(out, 200, "OK", "application/json", body.view(),
+                               req.minor_version, req.keep_alive);
+}
+#endif  // IRIS_HAVE_LIBPQ
 
 Outcome handle(const Request& req, Buffer& out, AsyncCtx& ctx) {
     if (req.path == "/plaintext") {
@@ -314,6 +364,18 @@ Outcome handle(const Request& req, Buffer& out, AsyncCtx& ctx) {
                                    "db unavailable", req.minor_version, false);
         return Outcome::kResponded;
     }
+#if defined(IRIS_HAVE_LIBPQ)
+    if (route_is(req.path, "/cached-queries")) {
+        if (g_cache_ready) {
+            handle_cached_queries(req, out);
+        } else {
+            iris::http::write_response(out, 503, "Service Unavailable",
+                                       "text/plain", "cache unavailable",
+                                       req.minor_version, false);
+        }
+        return Outcome::kResponded;
+    }
+#endif
     iris::http::write_response(out, 404, "Not Found", "text/plain", "",
                                req.minor_version, req.keep_alive);
     return Outcome::kResponded;
@@ -354,6 +416,18 @@ int main(int argc, char** argv) {
         cfg.db.fmt.world_one   = fmt_world_one;
         cfg.db.fmt.world_many  = fmt_world_many;
         cfg.db.fmt.fortunes    = fmt_fortunes;
+
+        // /cached-queries: snapshot CachedWorld into the in-process cache
+        // (blocking; one throwaway connection; before workers spawn).
+        const int loaded =
+            iris::db::fetch_world_cache(db_conninfo, g_world_cache, kCachedRows);
+        g_cache_ready = loaded > 0;
+        if (g_cache_ready) {
+            std::printf("[iris-gw] world cache: %d rows\n", loaded);
+        } else {
+            std::fprintf(stderr, "[iris-gw] world cache load failed; "
+                         "/cached-queries -> 503\n");
+        }
     }
 #else
     (void)db_conninfo;

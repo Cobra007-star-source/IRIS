@@ -119,6 +119,41 @@ bool PgConn::pipeline_exit() noexcept {
     return conn_ && ::PQexitPipelineMode(conn_) == 1;
 }
 
+// --- startup cache load --------------------------------------------------------
+
+int fetch_world_cache(const char* conninfo, std::int32_t* rns, int cap) noexcept {
+    PGconn* c = ::PQconnectdb(conninfo);
+    if (!c || ::PQstatus(c) != CONNECTION_OK) {
+        if (c) ::PQfinish(c);
+        return -1;
+    }
+    auto query = [&](const char* sql) -> PGresult* {
+        PGresult* r = ::PQexecParams(c, sql, 0, nullptr, nullptr, nullptr,
+                                     nullptr, /*binary=*/1);
+        if (r && ::PQresultStatus(r) == PGRES_TUPLES_OK) return r;
+        if (r) ::PQclear(r);
+        return nullptr;
+    };
+    PGresult* r = query("SELECT id, randomNumber FROM CachedWorld");
+    if (!r) r = query("SELECT id, randomNumber FROM World");
+    if (!r) {
+        ::PQfinish(c);
+        return -1;
+    }
+    const int rows = ::PQntuples(r);
+    int       n    = 0;
+    for (int i = 0; i < rows; ++i) {
+        const std::int32_t id = bin_int4(r, i, 0);
+        if (id >= 1 && id <= cap) {
+            rns[id - 1] = bin_int4(r, i, 1);
+            ++n;
+        }
+    }
+    ::PQclear(r);
+    ::PQfinish(c);
+    return n;
+}
+
 // --- binary result decoding --------------------------------------------------
 
 std::int32_t bin_int4(const pg_result* r, int row, int col) noexcept {

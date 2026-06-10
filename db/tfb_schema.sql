@@ -12,6 +12,17 @@ INSERT INTO World (id, randomNumber)
     SELECT x.id, floor(random() * 10000) + 1
     FROM generate_series(1, 10000) AS x(id);
 
+-- CachedWorld: identical shape to World; the /cached-queries route loads it
+-- into an in-process cache at startup (mirrors the official TFB database).
+DROP TABLE IF EXISTS CachedWorld;
+CREATE TABLE CachedWorld (
+    id           integer NOT NULL PRIMARY KEY,
+    randomNumber integer NOT NULL DEFAULT 0
+);
+INSERT INTO CachedWorld (id, randomNumber)
+    SELECT x.id, floor(random() * 10000) + 1
+    FROM generate_series(1, 10000) AS x(id);
+
 DROP TABLE IF EXISTS Fortune;
 CREATE TABLE Fortune (
     id      integer NOT NULL PRIMARY KEY,

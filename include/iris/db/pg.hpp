@@ -111,6 +111,13 @@ private:
     pg_conn* conn_ = nullptr;
 };
 
+// --- startup cache load (blocking, cold path) ---------------------------------
+// Fill `rns` (indexed by id-1, capacity `cap`) from the CachedWorld table,
+// falling back to World when CachedWorld does not exist (dev databases).
+// Returns the number of rows loaded, or -1 on connection/query failure.
+[[nodiscard]] int fetch_world_cache(const char* conninfo, std::int32_t* rns,
+                                    int cap) noexcept;
+
 // --- binary result decoding --------------------------------------------------
 // libpq returns binary int4 as big-endian. These helpers decode a single cell.
 [[nodiscard]] std::int32_t bin_int4(const pg_result* r, int row, int col) noexcept;
