@@ -36,7 +36,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -123,6 +122,46 @@ int random_world_id() noexcept {
 }
 
 enum class CState : std::uint8_t { kActive, kAwaitDb };
+
+// Grow-on-demand ring buffer (power-of-two capacity, monotonic indices).
+// Replaces std::deque for the DB wait queues: steady state never allocates or
+// frees chunks; growth happens only at a new peak queue depth.
+template <typename T>
+class Ring {
+public:
+    [[nodiscard]] bool empty() const noexcept { return head_ == tail_; }
+    [[nodiscard]] std::size_t size() const noexcept {
+        return static_cast<std::size_t>(tail_ - head_);
+    }
+    [[nodiscard]] T& front() noexcept { return buf_[head_ & mask_]; }
+    void pop_front() noexcept { ++head_; }
+    void push_back(const T& v) {
+        if (size() == buf_.size()) grow();
+        buf_[tail_ & mask_] = v;
+        ++tail_;
+    }
+    void push_front(const T& v) {
+        if (size() == buf_.size()) grow();
+        --head_;
+        buf_[head_ & mask_] = v;
+    }
+
+private:
+    void grow() {
+        const std::size_t ncap = buf_.empty() ? 64 : buf_.size() * 2;
+        std::vector<T>    nbuf(ncap);
+        const std::size_t n = size();
+        for (std::size_t i = 0; i < n; ++i) nbuf[i] = buf_[(head_ + i) & mask_];
+        buf_  = std::move(nbuf);
+        mask_ = ncap - 1;
+        head_ = 0;
+        tail_ = n;
+    }
+    std::vector<T> buf_;
+    std::size_t    mask_ = 0;
+    std::uint64_t  head_ = 0;
+    std::uint64_t  tail_ = 0;
+};
 
 struct Connection {
     int           fd                = -1;
@@ -216,10 +255,10 @@ struct Worker {
     std::string               db_conninfo;
     // FIFO of connections suspended because every DB slot was busy. Each entry
     // carries the connection's generation so a recycled connection is skipped.
-    std::deque<std::pair<Connection*, std::uint32_t>> db_waiters;
+    Ring<std::pair<Connection*, std::uint32_t>> db_waiters;
     // FIFO of suspended /db requests awaiting batch dispatch. kWorldOne always
     // queues here; the dispatcher drains up to kMaxBatch entries per idle slot.
-    std::deque<std::pair<Connection*, std::uint32_t>> db_one_queue;
+    Ring<std::pair<Connection*, std::uint32_t>> db_one_queue;
 #endif
 
     Connection* acquire(int fd) {
@@ -327,7 +366,7 @@ void db_release(Worker& w, int slot) {
             continue;  // stale entry
         int s = db_acquire(w);
         if (s < 0) {  // someone raced us; requeue and stop
-            w.db_waiters.emplace_front(c, gen);
+            w.db_waiters.push_front({c, gen});
             break;
         }
         db_start_on_slot(w, s, c);
@@ -1127,14 +1166,14 @@ bool AsyncCtx::run_db(DbRoute route, int count) noexcept {
     // dispatches it immediately (batch of 1, no added latency); under load
     // queued requests coalesce into one pipeline per slot.
     if (route == DbRoute::kWorldOne) {
-        w->db_one_queue.emplace_back(c, c->gen);
+        w->db_one_queue.push_back({c, c->gen});
         db_kick_one_queue(*w);
         return true;
     }
 
     int slot = db_acquire(*w);
     if (slot < 0) {
-        w->db_waiters.emplace_back(c, c->gen);  // pool busy: wait FIFO
+        w->db_waiters.push_back({c, c->gen});  // pool busy: wait FIFO
         return true;
     }
     db_start_on_slot(*w, slot, c);
