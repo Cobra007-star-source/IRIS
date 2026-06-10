@@ -148,9 +148,17 @@ struct Connection {
 };
 
 #if defined(IRIS_HAVE_LIBPQ)
-// One in-flight DB request. Lives in the worker's DB pool (one per connection
+// Max /db requests from DIFFERENT HTTP connections folded into one pipeline
+// on one DB connection. Under load this amortizes the PG socket syscalls and
+// epoll wakeups across the whole batch; at low load batches are size 1 and
+// behave exactly like a single dispatch (no added latency).
+constexpr int kMaxBatch = 32;
+
+// One in-flight DB job. Lives in the worker's DB pool (one per connection
 // slot), not per HTTP connection, so the row accumulators cost
-// pool_per_worker * ~4KB rather than per-client.
+// pool_per_worker * ~4KB rather than per-client. kWorldOne jobs serve a BATCH
+// of suspended HTTP connections (bconn[0..bn)); every other route serves the
+// single connection in `http`.
 struct DbJob {
     Connection*  http        = nullptr;  // suspended HTTP conn (null => orphaned)
     DbRoute      route       = DbRoute::kWorldOne;
@@ -164,6 +172,9 @@ struct DbJob {
     bool         sync_seen   = false;    // PGRES_PIPELINE_SYNC consumed
     int          html_len    = -1;       // /fortunes: prebuilt body length in
                                         //   tls_body (-1 => not built)
+    int          bn          = 0;        // /db batch: member count
+    int          bdone       = 0;        // /db batch: members responded
+    Connection*  bconn[kMaxBatch];       // /db batch: members (null => gone)
     std::int32_t ids[kMaxQueries];
     std::int32_t rns[kMaxQueries];
 };
@@ -206,6 +217,9 @@ struct Worker {
     // FIFO of connections suspended because every DB slot was busy. Each entry
     // carries the connection's generation so a recycled connection is skipped.
     std::deque<std::pair<Connection*, std::uint32_t>> db_waiters;
+    // FIFO of suspended /db requests awaiting batch dispatch. kWorldOne always
+    // queues here; the dispatcher drains up to kMaxBatch entries per idle slot.
+    std::deque<std::pair<Connection*, std::uint32_t>> db_one_queue;
 #endif
 
     Connection* acquire(int fd) {
@@ -234,11 +248,18 @@ struct Worker {
 
     void release(Connection* c) {
 #if defined(IRIS_HAVE_LIBPQ)
-        // If a DB query is still in flight for this connection, orphan the job
-        // rather than reusing the slot: the result must still be drained before
-        // the DB connection can serve another request.
+        // If a DB query is still in flight for this connection, orphan its job
+        // (or its batch membership) rather than reusing the slot: the result
+        // must still be drained before the DB connection can serve again.
         if (c->db_slot >= 0) {
-            db_jobs[c->db_slot].http = nullptr;
+            DbJob& j = db_jobs[c->db_slot];
+            if (j.http == c) {
+                j.http = nullptr;
+            } else {
+                for (int i = j.bdone; i < j.bn; ++i) {
+                    if (j.bconn[i] == c) { j.bconn[i] = nullptr; break; }
+                }
+            }
             c->db_slot = -1;
         }
 #endif
@@ -275,6 +296,7 @@ thread_local char tls_body[32768];
 void db_start_on_slot(Worker& w, int slot, Connection* c);
 void db_fail(Worker& w, int slot);
 void db_recover(Worker& w, int slot);
+void db_kick_one_queue(Worker& w);
 
 int db_acquire(Worker& w) {
     if (w.db_idle.empty()) return -1;
@@ -295,6 +317,7 @@ void db_release(Worker& w, int slot) {
     j.pipelined = false;
     j.sync_seen = false;
     j.html_len = -1;
+    j.bn = j.bdone = 0;
     w.db_idle.push_back(slot);
 
     while (!w.db_waiters.empty()) {
@@ -310,6 +333,8 @@ void db_release(Worker& w, int slot) {
         db_start_on_slot(w, s, c);
         break;
     }
+    // Any capacity left over goes to pending /db batches.
+    db_kick_one_queue(w);
 }
 
 // Big-endian encode for binary int4 query parameters: skips the snprintf here
@@ -430,6 +455,119 @@ void db_sort_by_id(std::int32_t* ids, std::int32_t* rns, int n) {
         j.want_write = false;
     }
     return true;
+}
+
+// ---- /db cross-request batching ----------------------------------------------
+
+// Finish ONE /db batch member: build its World-row response, resume the HTTP
+// connection, flush, and drain any pipelined bytes. Called as each tuple
+// result arrives (results come back in send order).
+void db_respond_one(Worker& w, Connection* c, std::int32_t id, std::int32_t rn) {
+    c->db_slot = -1;
+    c->state   = CState::kActive;
+
+    iris::http::Buffer body(tls_body, sizeof(tls_body));
+    if (w.fmt.world_one) w.fmt.world_one(body, id, rn);
+
+    const std::size_t  before = c->wlen;
+    iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+    iris::http::write_response(ob, 200, "OK", "application/json", body.view(),
+                               c->req_minor, c->req_keep_alive);
+    if (ob.overflow()) {
+        c->wlen = before;
+        iris::http::Buffer eb(c->wbuf, c->wcap, c->wlen);
+        iris::http::write_response(eb, 500, "Internal Server Error", "text/plain",
+                                   "response overflow", c->req_minor, false);
+        c->wlen = eb.size();
+        c->close_after_flush = true;
+    } else {
+        c->wlen = ob.size();
+        if (!c->req_keep_alive) c->close_after_flush = true;
+    }
+    if (c->read_paused) {
+        w.poller.mod(c->fd, kReadable);
+        c->read_paused = false;
+    }
+    if (!flush(w, *c)) { w.release(c); return; }
+    if (c->state == CState::kActive && c->rlen > 0) {
+        if (!drain(w, *c)) w.release(c);
+    }
+}
+
+// Fail ONE /db batch member with a 500 (its select errored or the batch's
+// connection died).
+void db_error_one(Worker& w, Connection* c) {
+    c->db_slot = -1;
+    c->state   = CState::kActive;
+    iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+    iris::http::write_response(ob, 500, "Internal Server Error", "text/plain",
+                               "db error", c->req_minor, false);
+    c->wlen = ob.size();
+    c->close_after_flush = true;
+    if (c->read_paused) {
+        w.poller.mod(c->fd, kReadable);
+        c->read_paused = false;
+    }
+    if (!flush(w, *c)) w.release(c);
+}
+
+// Pipeline `k` already-collected /db members (j.bconn[0..k)) onto `slot`: one
+// random World select per member, one sync, one flush for the whole batch.
+void db_start_one_batch(Worker& w, int slot, int k) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    j.http       = nullptr;
+    j.route      = DbRoute::kWorldOne;
+    j.total      = k;
+    j.recv       = 0;
+    j.sent       = 0;
+    j.failed     = false;
+    j.active     = true;
+    j.want_write = false;
+    j.pipelined  = false;
+    j.sync_seen  = false;
+    j.html_len   = -1;
+    j.bn         = k;
+    j.bdone      = 0;
+    for (int i = 0; i < k; ++i) j.bconn[i]->db_slot = slot;
+
+    bool ok = pc.pipeline_enter();
+    if (ok) {
+        j.pipelined = true;
+        char idbuf[4];
+        for (int i = 0; ok && i < k; ++i) {
+            be32(idbuf, static_cast<std::uint32_t>(random_world_id()));
+            const char* values[1] = {idbuf};
+            ok = pc.send_prepared(kStmtWorldSelect, 1, values, kParamLen4,
+                                  kParamFmtBin, /*result_binary=*/true);
+        }
+        if (ok) ok = pc.pipeline_sync();
+        j.sent = k;
+    }
+    if (!ok || !db_arm_flush(w, slot)) db_fail(w, slot);
+}
+
+// Drain the /db queue onto idle slots, batching up to kMaxBatch members per
+// slot. Skips stale entries (client gone / connection recycled).
+void db_kick_one_queue(Worker& w) {
+    while (!w.db_one_queue.empty()) {
+        int slot = db_acquire(w);
+        if (slot < 0) return;
+        DbJob& j = w.db_jobs[slot];
+        int    k = 0;
+        while (k < kMaxBatch && !w.db_one_queue.empty()) {
+            auto [c, gen] = w.db_one_queue.front();
+            w.db_one_queue.pop_front();
+            if (c->gen != gen || c->state != CState::kAwaitDb || c->db_slot != -1)
+                continue;  // stale entry
+            j.bconn[k++] = c;
+        }
+        if (k == 0) {  // queue held only stale entries
+            w.db_idle.push_back(slot);
+            return;
+        }
+        db_start_one_batch(w, slot, k);
+    }
 }
 
 // Bind connection `c`'s pending request to DB pool `slot`, dispatch the query,
@@ -628,10 +766,16 @@ void db_recover(Worker& w, int slot) {
     // else: not in db_idle (it was active), so capacity simply shrinks.
 }
 
-// A DB connection-level failure while serving `slot`: fail the HTTP request,
-// then recover the connection.
+// A DB connection-level failure while serving `slot`: fail the HTTP
+// request(s), then recover the connection.
 void db_fail(Worker& w, int slot) {
     DbJob& j = w.db_jobs[slot];
+    // /db batch members that have not been responded to yet.
+    for (int i = j.bdone; i < j.bn; ++i) {
+        if (j.bconn[i]) db_error_one(w, j.bconn[i]);
+        j.bconn[i] = nullptr;
+    }
+    j.bn = j.bdone = 0;
     if (j.http) {
         Connection* c = j.http;
         iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
@@ -659,15 +803,27 @@ void db_on_command_complete(Worker& w, int slot) {
     DbJob&      j  = w.db_jobs[slot];
     db::PgConn& pc = w.db_conns[slot];
 
-    // A pipelined fan-out (/queries, /updates) leaves the connection in
-    // pipeline mode. It MUST exit before the slot is reused by a non-pipelined
-    // route (/db prepared-without-sync would hang; /fortunes simple-query is
-    // illegal in pipeline mode). If exit fails, force a reconnect so the pool
-    // never hands out a wedged connection.
+    // A pipelined fan-out (/db batches, /queries, /updates) leaves the
+    // connection in pipeline mode. It MUST exit before the slot is reused by a
+    // non-pipelined route (/fortunes simple-query is illegal in pipeline
+    // mode). If exit fails, force a reconnect so the pool never hands out a
+    // wedged connection.
     bool force_recover = false;
     if (j.pipelined) {
         if (!pc.pipeline_exit()) force_recover = true;
         j.pipelined = false;
+    }
+
+    if (j.route == DbRoute::kWorldOne) {
+        // /db batch: successes were responded to inline as their tuples
+        // arrived; anything left over hit an error result.
+        for (int i = j.bdone; i < j.bn; ++i) {
+            if (j.bconn[i]) db_error_one(w, j.bconn[i]);
+            j.bconn[i] = nullptr;
+        }
+        j.bn = j.bdone = 0;
+        db_return_slot(w, slot, force_recover);
+        return;
     }
     db_finish_ex(w, slot, force_recover);
 }
@@ -694,6 +850,20 @@ void db_pump(Worker& w, int slot) {
             j.sync_seen = true;
         } else if (db::result_is_error(r)) {
             j.failed = true;
+        } else if (j.route == DbRoute::kWorldOne && db::result_ok_tuples(r) &&
+                   db::result_rows(r) >= 1) {
+            // /db batch: results return in send order, so the next tuple
+            // belongs to the next unanswered member. Respond immediately --
+            // the row data lives in `r`, no accumulation needed.
+            const std::int32_t id = db::bin_int4(r, 0, 0);
+            const std::int32_t rn = db::bin_int4(r, 0, 1);
+            if (j.bdone < j.bn) {
+                Connection* c       = j.bconn[j.bdone];
+                j.bconn[j.bdone]    = nullptr;
+                ++j.bdone;
+                if (c) db_respond_one(w, c, id, rn);
+            }
+            ++j.recv;
         } else if (j.route == DbRoute::kFortunes && db::result_ok_tuples(r)) {
             // The whole table arrives in one result. Decode + render the HTML
             // body NOW, while the message string_views still point into `r`.
@@ -952,6 +1122,15 @@ bool AsyncCtx::run_db(DbRoute route, int count) noexcept {
     c->pend_count = count;
     c->state      = CState::kAwaitDb;
     c->db_slot    = -1;
+
+    // /db always goes through the batch queue: with an idle slot the kick
+    // dispatches it immediately (batch of 1, no added latency); under load
+    // queued requests coalesce into one pipeline per slot.
+    if (route == DbRoute::kWorldOne) {
+        w->db_one_queue.emplace_back(c, c->gen);
+        db_kick_one_queue(*w);
+        return true;
+    }
 
     int slot = db_acquire(*w);
     if (slot < 0) {
