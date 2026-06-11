@@ -655,8 +655,14 @@ void db_start_on_slot(Worker& w, int slot, Connection* c) {
                          w.db_conns[slot].pipeline_sync();
             break;
         case DbRoute::kFortunes:
+            // Single prepared query, binary result, NOT pipelined: same shape as
+            // db_send_world_select. The extended protocol skips the per-request
+            // server-side parse/plan that the old simple-query path paid on every
+            // hit, and binary int4 ids avoid a text decode.
             j.total    = 0;
-            dispatched = w.db_conns[slot].send_query(kSqlFortuneAll);
+            dispatched = w.db_conns[slot].send_prepared(
+                kStmtFortuneAll, 0, nullptr, nullptr, nullptr,
+                /*result_binary=*/true);
             ++j.sent;
             break;
     }
@@ -845,9 +851,9 @@ void db_on_command_complete(Worker& w, int slot) {
 
     // A pipelined fan-out (/db batches, /queries, /updates) leaves the
     // connection in pipeline mode. It MUST exit before the slot is reused by a
-    // non-pipelined route (/fortunes simple-query is illegal in pipeline
-    // mode). If exit fails, force a reconnect so the pool never hands out a
-    // wedged connection.
+    // non-pipelined route (/db single select and /fortunes both send a lone
+    // extended-protocol query outside any pipeline). If exit fails, force a
+    // reconnect so the pool never hands out a wedged connection.
     bool force_recover = false;
     if (j.pipelined) {
         if (!pc.pipeline_exit()) force_recover = true;
@@ -907,14 +913,13 @@ void db_pump(Worker& w, int slot) {
         } else if (j.route == DbRoute::kFortunes && db::result_ok_tuples(r)) {
             // The whole table arrives in one result. Decode + render the HTML
             // body NOW, while the message string_views still point into `r`.
+            // Binary result: id is binary int4 (bin_int4); message is the raw
+            // varchar bytes (UTF-8), valid via text_field's PQgetlength.
             FortuneRow tmp[kMaxFortunes];
             const int  rows = db::result_rows(r);
             int        m    = 0;
             for (int i = 0; i < rows && m < kMaxFortunes; ++i, ++m) {
-                std::int32_t id = 0;
-                for (char ch : db::text_field(r, i, 0))
-                    if (ch >= '0' && ch <= '9') id = id * 10 + (ch - '0');
-                tmp[m].id      = id;
+                tmp[m].id      = db::bin_int4(r, i, 0);
                 tmp[m].message = db::text_field(r, i, 1);
             }
             iris::http::Buffer body(tls_body, sizeof(tls_body));
