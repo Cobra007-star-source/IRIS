@@ -54,6 +54,34 @@ add_executable(iris-gw main.cpp)
 target_link_libraries(iris-gw PRIVATE iris_net)
 target_compile_options(iris-gw PRIVATE ${IRIS_ARCH_FLAGS})
 
+# Web Framework Benchmark gateway (plain + json + static + optional DB profile).
+add_library(iris_wfb_net STATIC
+    ${CMAKE_SOURCE_DIR}/src/net/poller.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/server.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/date.cpp
+)
+target_include_directories(iris_wfb_net PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(iris_wfb_net PUBLIC cxx_std_20)
+target_compile_options(iris_wfb_net PRIVATE ${IRIS_ARCH_FLAGS})
+target_compile_definitions(iris_wfb_net PUBLIC IRIS_WFB=1)
+target_link_libraries(iris_wfb_net PUBLIC picohttpparser Threads::Threads)
+if(IRIS_BUILD_DB AND PQ_INCLUDE_DIR AND PQ_LIBRARY)
+    target_sources(iris_wfb_net PRIVATE ${CMAKE_SOURCE_DIR}/src/db/pg.cpp)
+    target_include_directories(iris_wfb_net PRIVATE ${PQ_INCLUDE_DIR})
+    target_link_libraries(iris_wfb_net PUBLIC ${PQ_LIBRARY})
+    target_compile_definitions(iris_wfb_net PUBLIC IRIS_HAVE_LIBPQ=1)
+endif()
+if(IRIS_PROFILE STREQUAL "racing")
+    target_compile_definitions(iris_wfb_net PUBLIC IRIS_PROFILE_RACING=1)
+else()
+    target_compile_definitions(iris_wfb_net PUBLIC IRIS_PROFILE_PRODUCTION=1)
+endif()
+
+add_executable(iris-wfb-gw wfb_main.cpp wfb_aggregate.cpp wfb_static.cpp)
+target_link_libraries(iris-wfb-gw PRIVATE iris_wfb_net)
+target_compile_options(iris-wfb-gw PRIVATE ${IRIS_ARCH_FLAGS})
+
 # Optional JIT serializer for the /json route. Built only with -DIRIS_ENABLE_JIT=ON
 # (asmjit is fetched by the root CMake before this subdirectory is added). The
 # default racing build stays free of asmjit and runs the portable C++
