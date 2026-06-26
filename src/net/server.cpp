@@ -22,6 +22,9 @@
 
 #include "iris/net/poller.hpp"
 #include "iris/net/socket.hpp"
+#if defined(IRIS_HAVE_IOURING)
+    #include "iris/net/iou_send.hpp"
+#endif
 #include "iris/http/date.hpp"
 #include "iris/http/parser.hpp"
 #include "iris/http/response.hpp"
@@ -41,7 +44,12 @@
 #include <vector>
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+    #include <sys/sendfile.h>
+#endif
 
 #if defined(__linux__)
     #include <linux/filter.h>
@@ -172,6 +180,10 @@ struct Connection {
                                               //   stale waiter-queue entries
     DbRoute       pend_route        = DbRoute::kWorldOne;  // queued request intent
     int           pend_count        = 0;                   //   "
+#if defined(IRIS_WFB)
+    char          pend_email[256]   = {};
+    int           pend_email_len    = 0;
+#endif
     int           req_minor         = 1;      // stashed at suspend for the reply
     bool          req_keep_alive    = true;   //   "
     bool          want_write        = false;
@@ -185,6 +197,15 @@ struct Connection {
     std::size_t   wcap  = 0;
     char*         rbuf  = nullptr;
     char*         wbuf  = nullptr;
+    // Tier 1: header in wbuf + body pointer sent via writev (xbody set).
+    // Tier 2: full frozen response in a sealed memfd sent via sendfile (xfd set).
+    // The two modes are mutually exclusive per response.
+    const char*   xbody = nullptr;
+    int           xfd   = -1;
+    std::size_t   xoff  = 0;
+    std::size_t   xlen  = 0;
+    std::size_t   xsent = 0;
+    bool          uring_inflight = false;
 };
 
 #if defined(IRIS_HAVE_LIBPQ)
@@ -217,6 +238,28 @@ struct DbJob {
     Connection*  bconn[kMaxBatch];       // /db batch: members (null => gone)
     std::int32_t ids[kMaxQueries];
     std::int32_t rns[kMaxQueries];
+#if defined(IRIS_WFB)
+    int          prof_phase       = 0;   // 1=phase1 in flight, 2=phase2
+    bool         user_found       = false;
+    std::int32_t user_id          = 0;
+    int          n_prof_posts     = 0;
+    int          n_prof_trending  = 0;
+    int          prof_json_len    = -1;
+    char         prof_username[256];
+    char         prof_email[256];
+    char         prof_created_at[64];
+    char         prof_last_login[64];
+    char         prof_settings[512];
+    struct WfbPostRow {
+        std::int32_t id;
+        std::int32_t views;
+        char         title[256];
+        char         content[256];
+        char         created_at[64];
+    };
+    WfbPostRow prof_posts[10];
+    WfbPostRow prof_trending[5];
+#endif
 };
 
 // Upper bound on Fortune rows we render (12 canonical + 1 appended + slack).
@@ -235,6 +278,24 @@ constexpr const char* kStmtWorldBulk = "iris_world_bulk";
 constexpr const char* kSqlWorldBulk  =
     "UPDATE World SET randomNumber = u.rn "
     "FROM unnest($1::int4[], $2::int4[]) AS u(id, rn) WHERE World.id = u.id";
+
+#if defined(IRIS_WFB)
+constexpr const char* kStmtWfbUser     = "iris_wfb_user";
+constexpr const char* kSqlWfbUser        =
+    "SELECT id, username, email, created_at, last_login, settings "
+    "FROM users WHERE email = $1";
+constexpr const char* kStmtWfbTrending = "iris_wfb_trending";
+constexpr const char* kSqlWfbTrending    =
+    "SELECT id, title, content, views, created_at FROM posts "
+    "ORDER BY views DESC LIMIT 5";
+constexpr const char* kStmtWfbUpdate   = "iris_wfb_update";
+constexpr const char* kSqlWfbUpdate      =
+    "UPDATE users SET last_login = NOW() WHERE id = $1 RETURNING last_login";
+constexpr const char* kStmtWfbPosts    = "iris_wfb_posts";
+constexpr const char* kSqlWfbPosts       =
+    "SELECT id, title, content, views, created_at FROM posts "
+    "WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10";
+#endif
 #endif  // IRIS_HAVE_LIBPQ
 
 struct Worker {
@@ -262,6 +323,10 @@ struct Worker {
     Ring<std::pair<Connection*, std::uint32_t>> db_one_queue;
 #endif
 
+#if defined(IRIS_HAVE_IOURING)
+    IouWorker                 iou{};
+#endif
+
     Connection* acquire(int fd) {
         Connection* c;
         if (!freelist.empty()) {
@@ -281,6 +346,11 @@ struct Worker {
         c->close_after_flush = false;
         c->read_paused = false;
         c->rlen = c->wlen = c->wsent = 0;
+        c->xbody = nullptr;
+        c->xfd   = -1;
+        c->xoff  = 0;
+        c->xlen = c->xsent = 0;
+        c->uring_inflight = false;
         if (static_cast<std::size_t>(fd) >= by_fd.size()) by_fd.resize(fd + 1, nullptr);
         by_fd[fd] = c;
         return c;
@@ -325,6 +395,10 @@ struct Worker {
 bool flush(Worker& w, Connection& c);
 bool drain(Worker& w, Connection& c);
 
+#if defined(IRIS_HAVE_IOURING)
+void on_iou_send_done(Worker& w, Connection& c, int res) noexcept;
+#endif
+
 // ---- async DB engine --------------------------------------------------------
 #if defined(IRIS_HAVE_LIBPQ)
 
@@ -337,6 +411,7 @@ void db_start_on_slot(Worker& w, int slot, Connection* c);
 void db_fail(Worker& w, int slot);
 void db_recover(Worker& w, int slot);
 void db_kick_one_queue(Worker& w);
+void db_return_slot(Worker& w, int slot, bool force_recover);
 
 int db_acquire(Worker& w) {
     if (w.db_idle.empty()) return -1;
@@ -358,6 +433,14 @@ void db_release(Worker& w, int slot) {
     j.sync_seen = false;
     j.html_len = -1;
     j.bn = j.bdone = 0;
+#if defined(IRIS_WFB)
+    j.prof_phase      = 0;
+    j.user_found      = false;
+    j.user_id         = 0;
+    j.n_prof_posts    = 0;
+    j.n_prof_trending = 0;
+    j.prof_json_len   = -1;
+#endif
     w.db_idle.push_back(slot);
 
     while (!w.db_waiters.empty()) {
@@ -460,7 +543,155 @@ bool db_send_bulk_update(Worker& w, int slot) {
                             /*result_binary=*/false);
 }
 
-// Sort the (id, rn) accumulators by id. A consistent ascending lock order is
+#if defined(IRIS_WFB)
+inline void copy_sv(char* dst, std::size_t cap, std::string_view sv) noexcept {
+    const std::size_t n = sv.size() < cap - 1 ? sv.size() : cap - 1;
+    if (n > 0) std::memcpy(dst, sv.data(), n);
+    dst[n] = '\0';
+}
+
+inline int parse_int_sv(std::string_view sv) noexcept {
+    int v = 0;
+    for (char c : sv) {
+        if (c < '0' || c > '9') break;
+        v = v * 10 + (c - '0');
+    }
+    return v;
+}
+
+inline void copy_post_row(DbJob::WfbPostRow& row, const pg_result* r,
+                          int i) noexcept {
+    row.id      = parse_int_sv(db::text_field(r, i, 0));
+    row.views   = parse_int_sv(db::text_field(r, i, 3));
+    copy_sv(row.title, sizeof(row.title), db::text_field(r, i, 1));
+    copy_sv(row.content, sizeof(row.content), db::text_field(r, i, 2));
+    copy_sv(row.created_at, sizeof(row.created_at), db::text_field(r, i, 4));
+}
+
+void json_escape_str(iris::http::Buffer& out, std::string_view s) noexcept {
+    for (char c : s) {
+        switch (c) {
+            case '"':  out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            case '\n': out.append("\\n");  break;
+            case '\r': out.append("\\r");  break;
+            case '\t': out.append("\\t");  break;
+            default:   out.append(c);
+        }
+    }
+}
+
+void wfb_write_post(iris::http::Buffer& out, const DbJob::WfbPostRow& p) noexcept {
+    out.append("{\"id\":");
+    out.append_uint(static_cast<std::size_t>(p.id));
+    out.append(",\"title\":\"");
+    json_escape_str(out, p.title);
+    out.append("\",\"content\":\"");
+    json_escape_str(out, p.content);
+    out.append("\",\"views\":");
+    out.append_uint(static_cast<std::size_t>(p.views));
+    out.append(",\"createdAt\":\"");
+    json_escape_str(out, p.created_at);
+    out.append("Z\"}");
+}
+
+void wfb_build_profile_json(DbJob& j) noexcept {
+    iris::http::Buffer out(tls_body, sizeof(tls_body));
+    out.append("{\"username\":\"");
+    json_escape_str(out, j.prof_username);
+    out.append("\",\"email\":\"");
+    json_escape_str(out, j.prof_email);
+    out.append("\",\"createdAt\":\"");
+    json_escape_str(out, j.prof_created_at);
+    out.append("Z\",\"lastLogin\":\"");
+    json_escape_str(out, j.prof_last_login);
+    out.append("Z\",\"settings\":");
+    out.append(j.prof_settings);
+    out.append(",\"posts\":[");
+    for (int i = 0; i < j.n_prof_posts; ++i) {
+        if (i) out.append(',');
+        wfb_write_post(out, j.prof_posts[i]);
+    }
+    out.append("],\"trending\":[");
+    for (int i = 0; i < j.n_prof_trending; ++i) {
+        if (i) out.append(',');
+        wfb_write_post(out, j.prof_trending[i]);
+    }
+    out.append("]}");
+    j.prof_json_len = static_cast<int>(out.size());
+}
+
+bool db_send_wfb_phase1(Worker& w, int slot, const char* email, int email_len) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    if (!pc.pipeline_enter()) return false;
+    j.pipelined = true;
+    const char* values[1]   = {email};
+    const int   lengths[1]  = {email_len};
+    const int   formats[1]  = {0};
+    if (!pc.send_prepared(kStmtWfbUser, 1, values, lengths, formats,
+                          /*result_binary=*/false)) {
+        return false;
+    }
+    ++j.sent;
+    if (!pc.send_prepared(kStmtWfbTrending, 0, nullptr, nullptr, nullptr,
+                          /*result_binary=*/false)) {
+        return false;
+    }
+    ++j.sent;
+    return pc.pipeline_sync();
+}
+
+bool db_send_wfb_phase2(Worker& w, int slot) {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    if (!pc.pipeline_enter()) return false;
+    j.pipelined = true;
+    char idbuf[16];
+    const int n = std::snprintf(idbuf, sizeof(idbuf), "%d", j.user_id);
+    const char* values[1]  = {idbuf};
+    const int   lengths[1] = {n};
+    const int   formats[1] = {0};
+    if (!pc.send_prepared(kStmtWfbUpdate, 1, values, lengths, formats,
+                          /*result_binary=*/false)) {
+        return false;
+    }
+    ++j.sent;
+    if (!pc.send_prepared(kStmtWfbPosts, 1, values, lengths, formats,
+                          /*result_binary=*/false)) {
+        return false;
+    }
+    ++j.sent;
+    return pc.pipeline_sync();
+}
+
+void wfb_finish_404(Worker& w, int slot, bool force_recover) {
+    DbJob&      j = w.db_jobs[slot];
+    Connection* c = j.http;
+    if (c == nullptr) {
+        db_return_slot(w, slot, force_recover);
+        return;
+    }
+    iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+    iris::http::write_response(ob, 404, "Not Found", "text/plain", "",
+                               c->req_minor, c->req_keep_alive);
+    c->wlen = ob.size();
+    if (!c->req_keep_alive) c->close_after_flush = true;
+    c->db_slot = -1;
+    c->state   = CState::kActive;
+    db_return_slot(w, slot, force_recover);
+    if (c->read_paused) {
+        w.poller.mod(c->fd, kReadable);
+        c->read_paused = false;
+    }
+    if (!flush(w, *c)) { w.release(c); return; }
+    if (c->state == CState::kActive && c->rlen > 0) {
+        if (!drain(w, *c)) w.release(c);
+    }
+}
+#endif  // IRIS_WFB
+
+// Sort the (id, rn) accumulators by id.
 // the standard guard against deadlocks when concurrent /updates transactions
 // touch overlapping rows. n is small (<=500), so an insertion sort on the
 // parallel arrays is cache-friendly and avoids packing into pairs.
@@ -665,6 +896,21 @@ void db_start_on_slot(Worker& w, int slot, Connection* c) {
                 /*result_binary=*/true);
             ++j.sent;
             break;
+#if defined(IRIS_WFB)
+        case DbRoute::kUserProfile:
+            copy_sv(j.prof_email, sizeof(j.prof_email),
+                    std::string_view(c->pend_email,
+                                     static_cast<std::size_t>(c->pend_email_len)));
+            j.prof_phase      = 1;
+            j.user_found      = false;
+            j.n_prof_posts    = 0;
+            j.n_prof_trending = 0;
+            j.prof_json_len   = -1;
+            j.total           = 2;
+            dispatched        = db_send_wfb_phase1(w, slot, c->pend_email,
+                                                     c->pend_email_len);
+            break;
+#endif
     }
 
     if (!dispatched) {
@@ -728,6 +974,13 @@ void db_finish_ex(Worker& w, int slot, bool force_recover) {
                 payload = std::string_view(tls_body,
                               j.html_len > 0 ? static_cast<std::size_t>(j.html_len) : 0);
                 break;
+#if defined(IRIS_WFB)
+            case DbRoute::kUserProfile:
+                payload = std::string_view(
+                    tls_body,
+                    j.prof_json_len > 0 ? static_cast<std::size_t>(j.prof_json_len) : 0);
+                break;
+#endif
         }
         const std::size_t  before = c->wlen;
         iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
@@ -790,7 +1043,14 @@ bool db_reconnect_slot(Worker& w, int slot) {
     if (!pc.connect(w.db_conninfo.c_str()) ||
         !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
         !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
-        !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)) {
+        !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)
+#if defined(IRIS_WFB)
+        || !pc.prepare(kStmtWfbUser, kSqlWfbUser, 1) ||
+        !pc.prepare(kStmtWfbTrending, kSqlWfbTrending, 0) ||
+        !pc.prepare(kStmtWfbUpdate, kSqlWfbUpdate, 1) ||
+        !pc.prepare(kStmtWfbPosts, kSqlWfbPosts, 1)
+#endif
+        ) {
         std::fprintf(stderr, "[iris-gw] DB slot %d reconnect failed: %s\n", slot,
                      pc.error().c_str());
         return false;
@@ -871,6 +1131,28 @@ void db_on_command_complete(Worker& w, int slot) {
         db_return_slot(w, slot, force_recover);
         return;
     }
+#if defined(IRIS_WFB)
+    if (j.route == DbRoute::kUserProfile && j.prof_phase == 1) {
+        if (!j.user_found) {
+            wfb_finish_404(w, slot, force_recover);
+            return;
+        }
+        j.prof_phase = 2;
+        j.recv = j.sent = 0;
+        j.sync_seen = false;
+        if (!db_send_wfb_phase2(w, slot)) {
+            db_fail(w, slot);
+            return;
+        }
+        if (!db_arm_flush(w, slot)) db_fail(w, slot);
+        return;
+    }
+    if (j.route == DbRoute::kUserProfile && j.prof_phase == 2) {
+        wfb_build_profile_json(j);
+        db_finish_ex(w, slot, force_recover);
+        return;
+    }
+#endif
     db_finish_ex(w, slot, force_recover);
 }
 
@@ -896,6 +1178,54 @@ void db_pump(Worker& w, int slot) {
             j.sync_seen = true;
         } else if (db::result_is_error(r)) {
             j.failed = true;
+#if defined(IRIS_WFB)
+        } else if (j.route == DbRoute::kUserProfile && db::result_ok_tuples(r)) {
+            if (j.prof_phase == 1) {
+                if (j.recv == 0) {
+                    if (db::result_rows(r) >= 1) {
+                        j.user_found = true;
+                        j.user_id    = parse_int_sv(db::text_field(r, 0, 0));
+                        copy_sv(j.prof_username, sizeof(j.prof_username),
+                                db::text_field(r, 0, 1));
+                        copy_sv(j.prof_email, sizeof(j.prof_email),
+                                db::text_field(r, 0, 2));
+                        copy_sv(j.prof_created_at, sizeof(j.prof_created_at),
+                                db::text_field(r, 0, 3));
+                        if (db::text_field(r, 0, 4).size() > 0) {
+                            copy_sv(j.prof_last_login, sizeof(j.prof_last_login),
+                                    db::text_field(r, 0, 4));
+                        } else {
+                            j.prof_last_login[0] = '\0';
+                        }
+                        copy_sv(j.prof_settings, sizeof(j.prof_settings),
+                                db::text_field(r, 0, 5));
+                    } else {
+                        j.user_found = false;
+                    }
+                } else if (j.recv == 1) {
+                    j.n_prof_trending = 0;
+                    const int rows = db::result_rows(r);
+                    for (int i = 0; i < rows && j.n_prof_trending < 5;
+                         ++i, ++j.n_prof_trending) {
+                        copy_post_row(j.prof_trending[j.n_prof_trending], r, i);
+                    }
+                }
+                ++j.recv;
+            } else if (j.prof_phase == 2) {
+                if (j.recv == 0 && db::result_rows(r) >= 1) {
+                    copy_sv(j.prof_last_login, sizeof(j.prof_last_login),
+                            db::text_field(r, 0, 0));
+                } else if (j.recv == 1) {
+                    j.n_prof_posts = 0;
+                    const int rows = db::result_rows(r);
+                    for (int i = 0; i < rows && j.n_prof_posts < 10;
+                         ++i, ++j.n_prof_posts) {
+                        copy_post_row(j.prof_posts[j.n_prof_posts], r, i);
+                    }
+                }
+                ++j.recv;
+            }
+#endif
         } else if (j.route == DbRoute::kWorldOne && db::result_ok_tuples(r) &&
                    db::result_rows(r) >= 1) {
             // /db batch: results return in send order, so the next tuple
@@ -974,12 +1304,91 @@ void on_db_event(Worker& w, int slot, std::uint32_t flags) {
 
 // ---- sync HTTP path ---------------------------------------------------------
 
+#if defined(IRIS_HAVE_IOURING)
+void on_iou_send_done(Worker& w, Connection& c, int res) noexcept {
+    c.uring_inflight = false;
+    if (res < 0) {
+        w.release(&c);
+        return;
+    }
+    c.xsent += static_cast<std::size_t>(res);
+    if (c.xsent < c.xlen) {
+        if (!flush(w, c)) w.release(&c);
+        return;
+    }
+    c.wlen  = 0;
+    c.wsent = 0;
+    c.xbody = nullptr;
+    c.xfd   = -1;
+    c.xoff  = 0;
+    c.xlen  = c.xsent = 0;
+    if (c.want_write) {
+        w.poller.mod(c.fd, kReadable);
+        c.want_write = false;
+    }
+    if (c.close_after_flush) {
+        w.release(&c);
+        return;
+    }
+    if (c.state == CState::kActive && c.rlen > 0) {
+        if (!drain(w, c)) w.release(&c);
+    }
+}
+#endif
+
 // Flush pending [wsent, wlen). Returns false to close the connection.
 bool flush(Worker& w, Connection& c) {
-    while (c.wsent < c.wlen) {
-        ssize_t n = ::send(c.fd, c.wbuf + c.wsent, c.wlen - c.wsent, MSG_NOSIGNAL);
+    // Three emit modes:
+    //   1) wbuf only (plain send)
+    //   2) wbuf header + xbody tail (writev / send)
+    //   3) sealed memfd slice via sendfile (Tier 2 frozen static responses)
+    while (c.wsent < c.wlen || (c.xbody && c.xsent < c.xlen) ||
+           (c.xfd >= 0 && c.xsent < c.xlen)) {
+        ssize_t n;
+        const std::size_t hdr_left = c.wlen - c.wsent;
+#if defined(__linux__)
+        if (hdr_left == 0 && c.xfd >= 0 && c.xsent < c.xlen) {
+#if defined(IRIS_HAVE_IOURING)
+            if (iou_send_enabled()) {
+                if (c.uring_inflight) return true;
+                if (iou_submit_send(&w.iou, c.fd, c.xoff + c.xsent,
+                                    c.xlen - c.xsent, &c)) {
+                    c.uring_inflight = true;
+                    iou_reap(&w.iou, &w,
+                             [](void* ctx, void* ud, int res) noexcept {
+                                 Worker&     wr = *static_cast<Worker*>(ctx);
+                                 Connection& cn = *static_cast<Connection*>(ud);
+                                 on_iou_send_done(wr, cn, res);
+                             });
+                    if (!c.uring_inflight) {
+                        return !c.close_after_flush;
+                    }
+                    return true;
+                }
+            }
+#endif
+            const std::size_t left = c.xlen - c.xsent;
+            off_t             off  = static_cast<off_t>(c.xoff + c.xsent);
+            n = ::sendfile(c.fd, c.xfd, &off, left);
+        } else
+#endif
+        if (hdr_left > 0 && c.xbody && c.xsent < c.xlen) {
+            struct iovec iov[2];
+            iov[0].iov_base = c.wbuf + c.wsent;
+            iov[0].iov_len  = hdr_left;
+            iov[1].iov_base = const_cast<char*>(c.xbody + c.xsent);
+            iov[1].iov_len  = c.xlen - c.xsent;
+            n = ::writev(c.fd, iov, 2);
+        } else if (hdr_left > 0) {
+            n = ::send(c.fd, c.wbuf + c.wsent, hdr_left, MSG_NOSIGNAL);
+        } else {
+            n = ::send(c.fd, c.xbody + c.xsent, c.xlen - c.xsent, MSG_NOSIGNAL);
+        }
         if (n > 0) {
-            c.wsent += static_cast<std::size_t>(n);
+            std::size_t adv = static_cast<std::size_t>(n);
+            const std::size_t h = c.wlen - c.wsent;
+            if (adv >= h) { c.wsent = c.wlen; adv -= h; c.xsent += adv; }
+            else          { c.wsent += adv; }
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -994,6 +1403,11 @@ bool flush(Worker& w, Connection& c) {
     }
     c.wlen  = 0;
     c.wsent = 0;
+    c.xbody = nullptr;
+    c.xfd   = -1;
+    c.xoff  = 0;
+    c.xlen  = c.xsent = 0;
+    c.uring_inflight = false;
     if (c.want_write) {
         w.poller.mod(c.fd, kReadable);
         c.want_write = false;
@@ -1044,6 +1458,24 @@ bool drain(Worker& w, Connection& c) {
 
         c.wlen = ob.size();
         off += pr.consumed;
+
+        // Zero-copy tail registered: the body lives outside wbuf and there is
+        // exactly one tail slot per connection, so it must be fully sent before
+        // the next pipelined response's header is appended. Flush now; if the
+        // socket blocks, stash the remaining pipelined bytes and resume later.
+        if (c.xbody != nullptr || c.xfd >= 0) {
+            if (!req.keep_alive) c.close_after_flush = true;
+            if (!flush(w, c)) return false;
+            if (c.want_write) {
+                if (off > 0) {
+                    std::memmove(c.rbuf, c.rbuf + off, c.rlen - off);
+                    c.rlen -= off;
+                }
+                return true;
+            }
+            if (c.close_after_flush) break;
+            continue;
+        }
 
         if (!req.keep_alive) {
             c.close_after_flush = true;
@@ -1126,6 +1558,18 @@ void worker_loop(Worker* wp, int cpu, bool pin) {
                 continue;
             }
 
+#if defined(IRIS_HAVE_IOURING)
+            if (iou_active() && fd == iou_ring_fd(&w.iou)) {
+                iou_reap(&w.iou, &w,
+                         [](void* ctx, void* ud, int res) noexcept {
+                             Worker&     wr = *static_cast<Worker*>(ctx);
+                             Connection& c  = *static_cast<Connection*>(ud);
+                             on_iou_send_done(wr, c, res);
+                         });
+                continue;
+            }
+#endif
+
 #if defined(IRIS_HAVE_LIBPQ)
             if (w.db_enabled &&
                 static_cast<std::size_t>(fd) < w.db_slot_by_fd.size() &&
@@ -1153,6 +1597,28 @@ void worker_loop(Worker* wp, int cpu, bool pin) {
 }
 
 }  // namespace
+
+void AsyncCtx::set_zerocopy_body(const char* data, std::size_t len) noexcept {
+    Connection* c = static_cast<Connection*>(conn_);
+    if (!c || data == nullptr || len == 0) return;
+    c->xbody = data;
+    c->xfd   = -1;
+    c->xoff  = 0;
+    c->xlen  = len;
+    c->xsent = 0;
+}
+
+void AsyncCtx::set_sendfile_response(int fd, std::size_t offset,
+                                     std::size_t len) noexcept {
+    Connection* c = static_cast<Connection*>(conn_);
+    if (!c || fd < 0 || len == 0) return;
+    c->xfd   = fd;
+    c->xoff  = offset;
+    c->xlen  = len;
+    c->xsent = 0;
+    c->xbody = nullptr;
+    c->uring_inflight = false;
+}
 
 // AsyncCtx::run_db lives here so it can see the file-local Worker / Connection.
 bool AsyncCtx::run_db(DbRoute route, int count) noexcept {
@@ -1191,9 +1657,50 @@ bool AsyncCtx::run_db(DbRoute route, int count) noexcept {
 #endif
 }
 
+#if defined(IRIS_WFB)
+bool AsyncCtx::run_db_profile(std::string_view email) noexcept {
+#if defined(IRIS_HAVE_LIBPQ)
+    Worker*     w = static_cast<Worker*>(worker_);
+    Connection* c = static_cast<Connection*>(conn_);
+    if (!w || !c || !w->db_enabled || email.empty()) return false;
+
+    const std::size_t n = email.size() < sizeof(c->pend_email) - 1
+                              ? email.size()
+                              : sizeof(c->pend_email) - 1;
+    std::memcpy(c->pend_email, email.data(), n);
+    c->pend_email[n]   = '\0';
+    c->pend_email_len  = static_cast<int>(n);
+    c->pend_route      = DbRoute::kUserProfile;
+    c->pend_count      = 0;
+    c->state           = CState::kAwaitDb;
+    c->db_slot         = -1;
+
+    int slot = db_acquire(*w);
+    if (slot < 0) {
+        w->db_waiters.push_back({c, c->gen});
+        return true;
+    }
+    db_start_on_slot(*w, slot, c);
+    return true;
+#else
+    (void)email;
+    return false;
+#endif
+}
+#endif  // IRIS_WFB
+
 int run_server(const ServerConfig& cfg, Handler handler) noexcept {
     ::signal(SIGPIPE, SIG_IGN);
     iris::http::start_date_clock();
+
+#if defined(IRIS_HAVE_IOURING)
+    if (cfg.iou_blob != nullptr && cfg.iou_blob_len > 0) {
+        iou_bind_region(cfg.iou_blob, cfg.iou_blob_len);
+        std::fprintf(stderr, "[iris-gw] io_uring static blob: %zu bytes (%s)\n",
+                     cfg.iou_blob_len,
+                     iou_active() ? "registered" : "bind failed");
+    }
+#endif
 
     int workers = cfg.workers > 0
                       ? cfg.workers
@@ -1228,6 +1735,19 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
         w->listener = lfd;
         w->poller.add(lfd, kReadable);
 
+#if defined(IRIS_HAVE_IOURING)
+        if (iou_active()) {
+            if (!iou_worker_init(&w->iou)) {
+                std::fprintf(stderr,
+                             "[iris-gw] worker %d io_uring init failed; "
+                             "static send falls back to sendfile\n",
+                             i);
+            } else {
+                w->poller.add(iou_ring_fd(&w->iou), kReadable);
+            }
+        }
+#endif
+
 #if defined(IRIS_HAVE_LIBPQ)
         if (cfg.db.conninfo != nullptr) {
             w->fmt         = cfg.db.fmt;
@@ -1240,7 +1760,14 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
                 if (!pc.connect(cfg.db.conninfo) ||
                     !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
                     !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
-                    !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)) {
+                    !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)
+#if defined(IRIS_WFB)
+                    || !pc.prepare(kStmtWfbUser, kSqlWfbUser, 1) ||
+                    !pc.prepare(kStmtWfbTrending, kSqlWfbTrending, 0) ||
+                    !pc.prepare(kStmtWfbUpdate, kSqlWfbUpdate, 1) ||
+                    !pc.prepare(kStmtWfbPosts, kSqlWfbPosts, 1)
+#endif
+                    ) {
                     std::fprintf(stderr, "[iris-gw] worker %d DB slot %d bringup "
                                  "failed: %s\n", i, s, pc.error().c_str());
                     return 1;

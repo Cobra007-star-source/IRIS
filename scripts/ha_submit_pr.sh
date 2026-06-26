@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Submit IRIS to MDA2AV/HttpArena as frameworks/iris.
+#
+# Prerequisites:
+#   - gh auth login
+#   - IRIS tag IRIS_REF pushed (Dockerfile clones iris-ha-gw from GitHub)
+#
+# Usage:  bash scripts/ha_submit_pr.sh
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORKDIR="${TMPDIR:-/tmp}/httparena-iris-pr"
+UPSTREAM="https://github.com/MDA2AV/HttpArena.git"
+FORK="${HA_FORK:-Cobra007-star-source/HttpArena}"
+BRANCH="${BRANCH:-add-iris-cpp}"
+IRIS_REF="${IRIS_REF:-v0.3.0-ha}"
+
+command -v gh >/dev/null 2>&1 || {
+  echo "error: install GitHub CLI: brew install gh && gh auth login" >&2
+  exit 1
+}
+
+rm -rf "$WORKDIR"
+GIT_HTTP_VERSION=1.1 git clone --depth 1 "$UPSTREAM" "$WORKDIR"
+cd "$WORKDIR"
+git checkout -b "$BRANCH"
+
+mkdir -p frameworks/iris
+rsync -a "$ROOT/httparena/frameworks/iris/" frameworks/iris/
+
+git add frameworks/iris/
+git status
+
+git commit -m "$(cat <<EOF
+Add C++/IRIS engine (baseline, pipelined, json, static)
+
+Docker image builds iris-ha-gw from ${IRIS_REF} on github.com/Cobra007-star-source/IRIS.
+AGPL-3.0. Verified on split-host EC2 (4096 conns): static ~296k req/s.
+EOF
+)"
+
+if ! gh repo view "$FORK" >/dev/null 2>&1; then
+  echo "[fork] creating fork $FORK ..."
+  gh repo fork MDA2AV/HttpArena --clone=false
+fi
+
+git remote add fork "git@github.com:${FORK}.git" 2>/dev/null || true
+git push -u fork "$BRANCH"
+
+sleep 2
+
+gh pr create \
+  --repo MDA2AV/HttpArena \
+  --head "Cobra007-star-source:${BRANCH}" \
+  --base main \
+  --title "Add C++/IRIS engine (iris-ha-gw)" \
+  --body "$(cat <<EOF
+## Summary
+
+Adds **IRIS** ([Cobra007-star-source/IRIS](https://github.com/Cobra007-star-source/IRIS), AGPL-3.0) as a C++ \`engine\` framework:
+
+- \`frameworks/iris\` — \`baseline\`, \`pipelined\`, \`limited-conn\`, \`json\`, \`static\`
+- Docker image clones IRIS at \`${IRIS_REF}\` and builds \`iris-ha-gw\` (Release, racing profile, no DB)
+
+## Design notes
+
+- Thread-per-core epoll/SO_REUSEPORT gateway with fixed per-connection buffers
+- \`/json/{count}?m=\` serializes from the mounted dataset per request
+- \`/static/*\` serves precompressed \`.br\`/\`.gz\` variants with Linux sendfile from sealed memfd responses
+
+## Test plan
+
+- [ ] CI builds \`frameworks/iris\` Docker image
+- [ ] \`/validate -f iris\` passes on the self-hosted runner
+EOF
+)"
+
+echo "Done. PR URL above."

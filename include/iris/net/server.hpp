@@ -38,6 +38,9 @@ enum class DbRoute : std::uint8_t {
     kWorldMany,    // /queries   : N random World rows
     kWorldUpdate,  // /updates   : N random World rows, then bulk UPDATE
     kFortunes,     // /fortunes  : all Fortune rows + one appended, sorted
+#if defined(IRIS_WFB)
+    kUserProfile,  // WFB /db/user-profile/:email
+#endif
 };
 
 // A decoded Fortune row. `message` points into the live PGresult and is only
@@ -69,6 +72,19 @@ public:
     // disabled or every pooled connection is busy -- the handler must then write
     // an error response and return Outcome::kResponded.
     [[nodiscard]] bool run_db(DbRoute route, int count) noexcept;
+
+#if defined(IRIS_WFB)
+    // WFB db_complex: fetch user profile by email (copied into the job).
+    [[nodiscard]] bool run_db_profile(std::string_view email) noexcept;
+#endif
+
+    // Tier 1 zero-copy: register an immutable body sent after header bytes via
+    // writev. Pointer must stay valid for the process lifetime.
+    void set_zerocopy_body(const char* data, std::size_t len) noexcept;
+
+    // Tier 2 frozen response: send [offset, offset+len) from a sealed memfd via
+    // sendfile with no user-space copy. Mutually exclusive with set_zerocopy_body.
+    void set_sendfile_response(int fd, std::size_t offset, std::size_t len) noexcept;
 
     // Set by the core immediately before each handler call (opaque worker /
     // connection pointers; defined in src/net/server.cpp).

@@ -82,6 +82,29 @@ add_executable(iris-wfb-gw wfb_main.cpp wfb_aggregate.cpp wfb_static.cpp)
 target_link_libraries(iris-wfb-gw PRIVATE iris_wfb_net)
 target_compile_options(iris-wfb-gw PRIVATE ${IRIS_ARCH_FLAGS})
 
+# HTTPArena gateway (baseline + pipelined + json + static). Reuses the same
+# network/parser core as the WFB build but carries no DB dependency: the
+# isolated H/1.1 profiles served here are CPU/IO bound, not database bound.
+add_library(iris_ha_net STATIC
+    ${CMAKE_SOURCE_DIR}/src/net/poller.cpp
+    ${CMAKE_SOURCE_DIR}/src/net/server.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/parser.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/date.cpp
+)
+target_include_directories(iris_ha_net PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(iris_ha_net PUBLIC cxx_std_20)
+target_compile_options(iris_ha_net PRIVATE ${IRIS_ARCH_FLAGS})
+target_link_libraries(iris_ha_net PUBLIC picohttpparser Threads::Threads)
+if(IRIS_PROFILE STREQUAL "racing")
+    target_compile_definitions(iris_ha_net PUBLIC IRIS_PROFILE_RACING=1)
+else()
+    target_compile_definitions(iris_ha_net PUBLIC IRIS_PROFILE_PRODUCTION=1)
+endif()
+
+add_executable(iris-ha-gw ha_main.cpp ha_json.cpp ha_static.cpp)
+target_link_libraries(iris-ha-gw PRIVATE iris_ha_net)
+target_compile_options(iris-ha-gw PRIVATE ${IRIS_ARCH_FLAGS})
+
 # Optional JIT serializer for the /json route. Built only with -DIRIS_ENABLE_JIT=ON
 # (asmjit is fetched by the root CMake before this subdirectory is added). The
 # default racing build stays free of asmjit and runs the portable C++

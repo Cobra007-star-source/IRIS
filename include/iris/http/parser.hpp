@@ -20,12 +20,12 @@ enum class ParseStatus {
 
 struct ParseResult {
     ParseStatus status   = ParseStatus::kIncomplete;
-    std::size_t consumed = 0;  // request-header byte count when status == kOk
+    std::size_t consumed = 0;  // header + body bytes when status == kOk
 };
 
-// Parse one request starting at buf[0..len). Fills `out` on success. The
-// request bodies of the TFB GET routes are empty, so `consumed` covers the
-// header block only.
+// Parse one request starting at buf[0..len). Fills `out` on success.
+// When Content-Length is present, returns kIncomplete until the full body
+// has arrived; then `consumed` covers headers + body and `out.body` is set.
 [[nodiscard]] ParseResult parse_request(const char* buf, std::size_t len,
                                         Request& out) noexcept;
 
