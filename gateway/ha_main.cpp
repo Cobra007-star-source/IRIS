@@ -8,18 +8,19 @@
 //   GET      /pipeline          -> text/plain "ok"
 //   GET      /json/{count}?m=N  -> application/json items with computed totals
 //   GET/HEAD /static/<name>     -> cached static file with correct Content-Type
+//   GET      /async-db?min=&max=&limit= -> JSON from Postgres (when configured)
+//   POST     /upload               -> text/plain byte count of body read
 //
-// Hot-path strategy mirrors the TFB gateway: /pipeline is served from a byte
-// template with a fixed-offset Date slot (memcpy + 29-byte patch, no per-request
-// formatting). /baseline11 formats only the small integer body. /json and
-// /static reuse precomputed per-item / per-file templates.
+// Plaintext :8080; json-tls :8081 (HTTPS, same /json routes).
 // =============================================================================
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 
+#include "ha_async_db.hpp"
 #include "ha_json.hpp"
 #include "ha_static.hpp"
 #include "iris/http/buffer.hpp"
@@ -74,7 +75,6 @@ inline bool path_is(std::string_view path, std::string_view route) noexcept {
                              path[route.size()] == '?');
 }
 
-// Parse the first signed integer at the front of `s` (after leading spaces).
 long parse_int(std::string_view s) noexcept {
     std::size_t i = 0;
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
@@ -91,7 +91,6 @@ long parse_int(std::string_view s) noexcept {
     return neg ? -v : v;
 }
 
-// Sum every numeric value in the query string of `path` (the part after '?').
 long sum_query(std::string_view path) noexcept {
     const std::size_t q = path.find('?');
     if (q == std::string_view::npos) return 0;
@@ -116,7 +115,6 @@ void emit_text_int(Buffer& out, long value, const Request& req) noexcept {
                                req.minor_version, req.keep_alive);
 }
 
-// Parse "/json/{count}" and the "m" query param. Returns false if malformed.
 bool parse_json_path(std::string_view path, std::size_t& count,
                      long& multiplier) noexcept {
     std::string_view rest = path;
@@ -131,6 +129,24 @@ bool parse_json_path(std::string_view path, std::size_t& count,
     multiplier = 1;
     const std::size_t q = path.find("m=");
     if (q != std::string_view::npos) multiplier = parse_int(path.substr(q + 2));
+    return true;
+}
+
+bool handle_json(Buffer& out, const Request& req, std::string_view path) noexcept {
+    std::size_t count = 0;
+    long        m     = 1;
+    if (parse_json_path(path, count, m) && iris::ha::dataset_size() > 0) {
+        static thread_local char body_buf[262144];
+        Buffer body(body_buf, sizeof(body_buf));
+        iris::ha::serialize_json(body, count, m);
+        iris::http::write_response(out, 200, "OK", "application/json",
+                                   body.view(), req.minor_version,
+                                   req.keep_alive);
+        return true;
+    }
+    iris::http::write_response(out, 503, "Service Unavailable", "text/plain",
+                               "dataset unavailable", req.minor_version,
+                               req.keep_alive);
     return true;
 }
 
@@ -155,20 +171,20 @@ Outcome handle(const Request& req, Buffer& out, AsyncCtx& ctx) {
     }
 
     if (path.rfind("/json/", 0) == 0) {
-        std::size_t count = 0;
-        long        m     = 1;
-        if (parse_json_path(path, count, m) && iris::ha::dataset_size() > 0) {
-            static thread_local char body_buf[262144];
-            Buffer body(body_buf, sizeof(body_buf));
-            iris::ha::serialize_json(body, count, m);
-            iris::http::write_response(out, 200, "OK", "application/json",
-                                       body.view(), req.minor_version,
-                                       req.keep_alive);
-        } else {
-            iris::http::write_response(out, 503, "Service Unavailable",
-                                       "text/plain", "dataset unavailable",
-                                       req.minor_version, req.keep_alive);
-        }
+        handle_json(out, req, path);
+        return Outcome::kResponded;
+    }
+
+    if (path_is(path, "/async-db")) {
+        int min_p = 10, max_p = 50, lim = 50;
+        iris::ha::parse_async_db_query(path, min_p, max_p, lim);
+        if (ctx.run_ha_async_db(min_p, max_p, lim)) return Outcome::kSuspended;
+        iris::ha::write_empty_async_db(out, req);
+        return Outcome::kResponded;
+    }
+
+    if (path_is(path, "/upload") && req.method == "POST") {
+        emit_text_int(out, static_cast<long>(req.body.size()), req);
         return Outcome::kResponded;
     }
 
@@ -182,6 +198,11 @@ Outcome handle(const Request& req, Buffer& out, AsyncCtx& ctx) {
     return Outcome::kResponded;
 }
 
+const char* env_or(const char* key, const char* fallback) noexcept {
+    const char* v = std::getenv(key);
+    return (v != nullptr && v[0] != '\0') ? v : fallback;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -189,18 +210,29 @@ int main(int argc, char** argv) {
     cfg.read_cap  = 65536;
     cfg.write_cap = 262144;
 
-    const char* dataset = std::getenv("DATASET_PATH");
-    const char* static_dir = std::getenv("STATIC_DIR");
-    if (dataset == nullptr)    dataset = "/data/dataset.json";
-    if (static_dir == nullptr) static_dir = "/data/static";
+    const char* dataset    = env_or("DATASET_PATH", "/data/dataset.json");
+    const char* static_dir = env_or("STATIC_DIR", "/data/static");
+    const char* db_url     = std::getenv("DATABASE_URL");
+    const char* tls_cert   = env_or("TLS_CERT", "/certs/server.crt");
+    const char* tls_key    = env_or("TLS_KEY", "/certs/server.key");
+
+    cfg.port     = 8080;
+    cfg.tls_port = 8081;
+    cfg.tls_cert = tls_cert;
+    cfg.tls_key  = tls_key;
 
     if (const char* port_env = std::getenv("PORT")) {
         cfg.port = static_cast<std::uint16_t>(std::atoi(port_env));
+    }
+    if (const char* tls_port_env = std::getenv("TLS_PORT")) {
+        cfg.tls_port = static_cast<std::uint16_t>(std::atoi(tls_port_env));
     }
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             cfg.port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--tls-port") == 0 && i + 1 < argc) {
+            cfg.tls_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             cfg.workers = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--no-pin") == 0) {
@@ -209,11 +241,29 @@ int main(int argc, char** argv) {
             dataset = argv[++i];
         } else if (std::strcmp(argv[i], "--static-dir") == 0 && i + 1 < argc) {
             static_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--no-tls") == 0) {
+            cfg.tls_port = 0;
         } else if (std::strcmp(argv[i], "--help") == 0) {
-            std::printf("usage: iris-ha-gw [--port N] [--workers N] [--no-pin]"
-                        " [--dataset PATH] [--static-dir DIR]\n");
+            std::printf(
+                "usage: iris-ha-gw [--port N] [--tls-port N] [--workers N] [--no-pin]"
+                " [--no-tls] [--dataset PATH] [--static-dir DIR]\n");
             return 0;
         }
+    }
+
+    if (db_url != nullptr) {
+        cfg.db.conninfo = db_url;
+        int max_conn = 256;
+        if (const char* mc = std::getenv("DATABASE_MAX_CONN")) {
+            max_conn = std::atoi(mc);
+        }
+        if (max_conn < 1) max_conn = 1;
+        const int ncpu =
+            cfg.workers > 0 ? cfg.workers
+                            : static_cast<int>(std::thread::hardware_concurrency());
+        const int workers = ncpu > 0 ? ncpu : 1;
+        cfg.db.pool_per_worker = max_conn / workers;
+        if (cfg.db.pool_per_worker < 1) cfg.db.pool_per_worker = 1;
     }
 
     iris::http::start_date_clock();
@@ -222,9 +272,11 @@ int main(int argc, char** argv) {
     const bool ds_ok = iris::ha::load_dataset(dataset);
     const bool st_ok = iris::ha::load_static(static_dir);
 
-    std::printf("[iris-ha-gw] listening on :%u dataset=%s(%zu items) static=%s(%s)\n",
-                static_cast<unsigned>(cfg.port), dataset,
-                iris::ha::dataset_size(), static_dir, st_ok ? "ok" : "missing");
+    std::printf("[iris-ha-gw] listen :%u tls:%u dataset=%s(%zu) static=%s(%s) db=%s\n",
+                static_cast<unsigned>(cfg.port),
+                static_cast<unsigned>(cfg.tls_port),
+                dataset, iris::ha::dataset_size(), static_dir, st_ok ? "ok" : "missing",
+                db_url ? "on" : "off");
     if (!ds_ok) {
         std::fprintf(stderr, "[iris-ha-gw] dataset not loaded; /json -> 503\n");
     }

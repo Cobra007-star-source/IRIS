@@ -25,6 +25,12 @@
 #if defined(IRIS_HAVE_IOURING)
     #include "iris/net/iou_send.hpp"
 #endif
+#if defined(IRIS_HAVE_TLS)
+    #include "iris/net/tls.hpp"
+#endif
+#if defined(IRIS_HA)
+    #include "ha_async_db.hpp"
+#endif
 #include "iris/http/date.hpp"
 #include "iris/http/parser.hpp"
 #include "iris/http/response.hpp"
@@ -95,7 +101,11 @@ namespace {
 
 // Max bytes any single response can occupy; drain() guarantees this much room
 // before invoking the handler. Sized for /queries (up to 500 rows of JSON).
+#if defined(IRIS_HA)
+constexpr std::size_t kRespReserve = 102400;
+#else
 constexpr std::size_t kRespReserve = 24576;
+#endif
 
 // TFB World table key space and the per-request query fan-out clamp.
 constexpr int kWorldRows  = 10000;
@@ -130,7 +140,14 @@ int random_world_id() noexcept {
     return 1 + static_cast<int>(rng_next() % kWorldRows);
 }
 
-enum class CState : std::uint8_t { kActive, kAwaitDb };
+enum class CState : std::uint8_t {
+    kActive,
+    kAwaitDb,
+    kTlsHandshake,
+#if defined(IRIS_HA)
+    kUploadDrain,
+#endif
+};
 
 // Grow-on-demand ring buffer (power-of-two capacity, monotonic indices).
 // Replaces std::deque for the DB wait queues: steady state never allocates or
@@ -180,6 +197,12 @@ struct Connection {
                                               //   stale waiter-queue entries
     DbRoute       pend_route        = DbRoute::kWorldOne;  // queued request intent
     int           pend_count        = 0;                   //   "
+#if defined(IRIS_HA)
+    int           ha_min            = 10;
+    int           ha_max            = 50;
+    std::size_t   upload_total      = 0;
+    std::size_t   upload_remain     = 0;
+#endif
 #if defined(IRIS_WFB)
     char          pend_email[256]   = {};
     int           pend_email_len    = 0;
@@ -206,6 +229,9 @@ struct Connection {
     std::size_t   xlen  = 0;
     std::size_t   xsent = 0;
     bool          uring_inflight = false;
+#if defined(IRIS_HAVE_TLS)
+    void*         ssl            = nullptr;
+#endif
 };
 
 #if defined(IRIS_HAVE_LIBPQ)
@@ -296,11 +322,26 @@ constexpr const char* kSqlWfbPosts       =
     "SELECT id, title, content, views, created_at FROM posts "
     "WHERE user_id = $1 ORDER BY created_at DESC LIMIT 10";
 #endif
+#if defined(IRIS_HA)
+constexpr const char* kStmtHaAsyncDb = "iris_ha_async_db";
+constexpr const char* kSqlHaAsyncDb  =
+    "SELECT id, name, category, price, quantity, active, tags, rating_score, "
+    "rating_count FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3";
+#endif
 #endif  // IRIS_HAVE_LIBPQ
+
+#if defined(IRIS_HAVE_TLS)
+inline ssl_st* conn_ssl(Connection& c) noexcept {
+    return static_cast<ssl_st*>(c.ssl);
+}
+#endif
 
 struct Worker {
     Poller                    poller;
     int                       listener = -1;
+#if defined(IRIS_HAVE_TLS)
+    int                       tls_listener = -1;
+#endif
     Handler                   handler  = nullptr;
     std::size_t               rcap     = 4096;
     std::size_t               wcap     = 32768;
@@ -351,6 +392,12 @@ struct Worker {
         c->xoff  = 0;
         c->xlen = c->xsent = 0;
         c->uring_inflight = false;
+#if defined(IRIS_HA)
+        c->upload_total = c->upload_remain = 0;
+#endif
+#if defined(IRIS_HAVE_TLS)
+        c->ssl = nullptr;
+#endif
         if (static_cast<std::size_t>(fd) >= by_fd.size()) by_fd.resize(fd + 1, nullptr);
         by_fd[fd] = c;
         return c;
@@ -371,6 +418,12 @@ struct Worker {
                 }
             }
             c->db_slot = -1;
+        }
+#endif
+#if defined(IRIS_HAVE_TLS)
+        if (c->ssl != nullptr) {
+            iris::net::tls::free_conn(conn_ssl(*c));
+            c->ssl = nullptr;
         }
 #endif
         if (c->fd >= 0) {
@@ -395,6 +448,24 @@ struct Worker {
 bool flush(Worker& w, Connection& c);
 bool drain(Worker& w, Connection& c);
 
+#if defined(IRIS_HAVE_TLS)
+inline ssize_t conn_recv(Connection& c, char* buf, std::size_t len) noexcept {
+    return iris::net::tls::read(conn_ssl(c), c.fd, buf, len);
+}
+
+inline ssize_t conn_send(Connection& c, const char* buf, std::size_t len) noexcept {
+    return iris::net::tls::write(conn_ssl(c), c.fd, buf, len);
+}
+#else
+inline ssize_t conn_recv(Connection& c, char* buf, std::size_t len) noexcept {
+    return ::recv(c.fd, buf, len, 0);
+}
+
+inline ssize_t conn_send(Connection& c, const char* buf, std::size_t len) noexcept {
+    return ::send(c.fd, buf, len, MSG_NOSIGNAL);
+}
+#endif
+
 #if defined(IRIS_HAVE_IOURING)
 void on_iou_send_done(Worker& w, Connection& c, int res) noexcept;
 #endif
@@ -404,7 +475,11 @@ void on_iou_send_done(Worker& w, Connection& c, int res) noexcept;
 
 // Response body scratch. Built first (so Content-Length is known), then handed
 // to write_response. 32 KiB covers /queries' 500-row array and /fortunes.
+#if defined(IRIS_HA)
+thread_local char tls_body[98304];
+#else
 thread_local char tls_body[32768];
+#endif
 
 // Forward decls for the mutually-recursive release <-> dispatch path.
 void db_start_on_slot(Worker& w, int slot, Connection* c);
@@ -480,7 +555,6 @@ inline std::size_t put_uint(char* p, std::uint32_t v) noexcept {
     return static_cast<std::size_t>(n);
 }
 
-// Send one World select (binary id param, binary result). Used by /db.
 bool db_send_world_select(Worker& w, int slot) {
     DbJob&      j  = w.db_jobs[slot];
     db::PgConn& pc = w.db_conns[slot];
@@ -494,6 +568,37 @@ bool db_send_world_select(Worker& w, int slot) {
     ++j.sent;
     return true;
 }
+
+#if defined(IRIS_HA)
+bool db_send_ha_async_db(Worker& w, int slot, int min_p, int max_p,
+                         int limit) noexcept {
+    DbJob&      j  = w.db_jobs[slot];
+    db::PgConn& pc = w.db_conns[slot];
+    char        pmin[4], pmax[4], plim[4];
+    be32(pmin, static_cast<std::uint32_t>(min_p));
+    be32(pmax, static_cast<std::uint32_t>(max_p));
+    be32(plim, static_cast<std::uint32_t>(limit));
+    const char* values[3] = {pmin, pmax, plim};
+    constexpr int kLens[3] = {4, 4, 4};
+    constexpr int kFmts[3] = {1, 1, 1};
+    if (!pc.send_prepared(kStmtHaAsyncDb, 3, values, kLens, kFmts,
+                          /*result_binary=*/false)) {
+        return false;
+    }
+    j.sent = 1;
+    return true;
+}
+
+void db_respond_ha_empty(Worker& w, Connection* c) noexcept {
+    if (c == nullptr) return;
+    iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
+    iris::http::write_response(ob, 200, "OK", "application/json",
+                               "{\"items\":[],\"count\":0}", c->req_minor,
+                               c->req_keep_alive);
+    c->wlen = ob.size();
+    if (!c->req_keep_alive) c->close_after_flush = true;
+}
+#endif
 
 // Enter pipeline mode and fan out `n` independent World selects (PG14+). TFB
 // forbids collapsing the reads into a single IN/ANY query, so each id is its
@@ -896,6 +1001,13 @@ void db_start_on_slot(Worker& w, int slot, Connection* c) {
                 /*result_binary=*/true);
             ++j.sent;
             break;
+#if defined(IRIS_HA)
+        case DbRoute::kHaAsyncDb:
+            j.total    = c->pend_count;
+            dispatched = db_send_ha_async_db(w, slot, c->ha_min, c->ha_max,
+                                             c->pend_count);
+            break;
+#endif
 #if defined(IRIS_WFB)
         case DbRoute::kUserProfile:
             copy_sv(j.prof_email, sizeof(j.prof_email),
@@ -981,6 +1093,13 @@ void db_finish_ex(Worker& w, int slot, bool force_recover) {
                     j.prof_json_len > 0 ? static_cast<std::size_t>(j.prof_json_len) : 0);
                 break;
 #endif
+#if defined(IRIS_HA)
+            case DbRoute::kHaAsyncDb:
+                payload = std::string_view(
+                    tls_body,
+                    j.html_len > 0 ? static_cast<std::size_t>(j.html_len) : 0);
+                break;
+#endif
         }
         const std::size_t  before = c->wlen;
         iris::http::Buffer ob(c->wbuf, c->wcap, c->wlen);
@@ -1041,6 +1160,9 @@ bool db_reconnect_slot(Worker& w, int slot) {
             w.db_slot_by_fd[old_fd] = -1;
     }
     if (!pc.connect(w.db_conninfo.c_str()) ||
+#if defined(IRIS_HA)
+        !pc.prepare(kStmtHaAsyncDb, kSqlHaAsyncDb, 3)
+#else
         !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
         !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
         !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)
@@ -1049,6 +1171,7 @@ bool db_reconnect_slot(Worker& w, int slot) {
         !pc.prepare(kStmtWfbTrending, kSqlWfbTrending, 0) ||
         !pc.prepare(kStmtWfbUpdate, kSqlWfbUpdate, 1) ||
         !pc.prepare(kStmtWfbPosts, kSqlWfbPosts, 1)
+#endif
 #endif
         ) {
         std::fprintf(stderr, "[iris-gw] DB slot %d reconnect failed: %s\n", slot,
@@ -1076,6 +1199,22 @@ void db_recover(Worker& w, int slot) {
 // request(s), then recover the connection.
 void db_fail(Worker& w, int slot) {
     DbJob& j = w.db_jobs[slot];
+#if defined(IRIS_HA)
+    if (j.route == DbRoute::kHaAsyncDb && j.http != nullptr) {
+        Connection* c = j.http;
+        db_respond_ha_empty(w, c);
+        c->db_slot = -1;
+        c->state   = CState::kActive;
+        j.http     = nullptr;
+        if (c->read_paused) {
+            w.poller.mod(c->fd, kReadable);
+            c->read_paused = false;
+        }
+        if (!flush(w, *c)) w.release(c);
+        db_recover(w, slot);
+        return;
+    }
+#endif
     // /db batch members that have not been responded to yet.
     for (int i = j.bdone; i < j.bn; ++i) {
         if (j.bconn[i]) db_error_one(w, j.bconn[i]);
@@ -1240,6 +1379,12 @@ void db_pump(Worker& w, int slot) {
                 if (c) db_respond_one(w, c, id, rn);
             }
             ++j.recv;
+#if defined(IRIS_HA)
+        } else if (j.route == DbRoute::kHaAsyncDb && db::result_ok_tuples(r)) {
+            j.html_len = iris::ha::format_async_db_json(tls_body, sizeof(tls_body), r);
+            if (j.html_len < 0) j.failed = true;
+            ++j.recv;
+#endif
         } else if (j.route == DbRoute::kFortunes && db::result_ok_tuples(r)) {
             // The whole table arrives in one result. Decode + render the HTML
             // body NOW, while the message string_views still point into `r`.
@@ -1380,9 +1525,9 @@ bool flush(Worker& w, Connection& c) {
             iov[1].iov_len  = c.xlen - c.xsent;
             n = ::writev(c.fd, iov, 2);
         } else if (hdr_left > 0) {
-            n = ::send(c.fd, c.wbuf + c.wsent, hdr_left, MSG_NOSIGNAL);
+            n = conn_send(c, c.wbuf + c.wsent, hdr_left);
         } else {
-            n = ::send(c.fd, c.xbody + c.xsent, c.xlen - c.xsent, MSG_NOSIGNAL);
+            n = conn_send(c, c.xbody + c.xsent, c.xlen - c.xsent);
         }
         if (n > 0) {
             std::size_t adv = static_cast<std::size_t>(n);
@@ -1415,6 +1560,87 @@ bool flush(Worker& w, Connection& c) {
     return !c.close_after_flush;
 }
 
+#if defined(IRIS_HA)
+inline bool is_ha_upload(const iris::http::Request& req) noexcept {
+    if (req.method != "POST") return false;
+    const std::string_view path = req.path;
+    return path == "/upload" ||
+           (path.size() > 7 && path.substr(0, 7) == "/upload" && path[7] == '?');
+}
+
+bool upload_respond(Worker& w, Connection& c, std::size_t nbytes) noexcept {
+    if (c.wcap - c.wlen < kRespReserve) {
+        if (!flush(w, c)) return false;
+        if (c.want_write) return true;
+    }
+    char tmp[24];
+    const int n = std::snprintf(tmp, sizeof(tmp), "%zu", nbytes);
+    iris::http::Buffer ob(c.wbuf, c.wcap, c.wlen);
+    iris::http::write_response(
+        ob, 200, "OK", "text/plain",
+        std::string_view(tmp, static_cast<std::size_t>(n)), c.req_minor,
+        c.req_keep_alive);
+    c.wlen = ob.size();
+    if (!c.req_keep_alive) c.close_after_flush = true;
+    if (!flush(w, c)) return false;
+    return true;
+}
+
+// Discard buffered upload bytes; respond when upload_remain hits zero.
+bool upload_progress(Worker& w, Connection& c) noexcept {
+    while (c.upload_remain > 0 && c.rlen > 0) {
+        const std::size_t take = std::min(c.rlen, c.upload_remain);
+        c.upload_remain -= take;
+        if (take < c.rlen) {
+            std::memmove(c.rbuf, c.rbuf + take, c.rlen - take);
+        }
+        c.rlen -= take;
+    }
+    if (c.upload_remain > 0) return true;
+
+    const std::size_t total = c.upload_total;
+    c.upload_total  = 0;
+    c.upload_remain = 0;
+    c.state         = CState::kActive;
+    if (!upload_respond(w, c, total)) return false;
+    if (c.want_write || c.close_after_flush) return true;
+    return drain(w, c);
+}
+
+bool upload_begin(Worker& w, Connection& c, std::size_t off,
+                  const iris::http::Request& req, std::size_t header_end) noexcept {
+    const std::size_t avail = c.rlen - off;
+    const std::size_t body_in_buf =
+        avail > header_end ? avail - header_end : 0;
+
+    c.req_minor      = req.minor_version;
+    c.req_keep_alive = req.keep_alive;
+    c.upload_total   = req.content_length;
+
+    if (body_in_buf >= req.content_length) {
+        if (!upload_respond(w, c, req.content_length)) return false;
+        const std::size_t consumed = header_end + req.content_length;
+        if (consumed < c.rlen) {
+            std::memmove(c.rbuf, c.rbuf + consumed, c.rlen - consumed);
+        }
+        c.rlen -= consumed;
+        if (c.want_write || c.close_after_flush) return true;
+        return drain(w, c);
+    }
+
+    c.upload_remain = req.content_length - body_in_buf;
+    c.state         = CState::kUploadDrain;
+    const std::size_t consumed = header_end + body_in_buf;
+    if (consumed > 0) {
+        if (consumed < c.rlen) {
+            std::memmove(c.rbuf, c.rbuf + consumed, c.rlen - consumed);
+        }
+        c.rlen -= consumed;
+    }
+    return upload_progress(w, c);
+}
+#endif
+
 // Parse and respond to every complete (pipelined) request currently buffered.
 // Stops early (returns true, leaving bytes in rbuf) if the connection suspends
 // on an async DB op.
@@ -1423,7 +1649,23 @@ bool drain(Worker& w, Connection& c) {
     while (off < c.rlen) {
         iris::http::Request req;
         auto pr = iris::http::parse_request(c.rbuf + off, c.rlen - off, req);
-        if (pr.status == iris::http::ParseStatus::kIncomplete) break;
+        if (pr.status == iris::http::ParseStatus::kIncomplete) {
+#if defined(IRIS_HA)
+            std::size_t header_end = 0;
+            auto hr = iris::http::parse_request_headers(c.rbuf + off, c.rlen - off,
+                                                        req, header_end);
+            if (hr.status == iris::http::ParseStatus::kIncomplete && header_end > 0 &&
+                is_ha_upload(req) && req.content_length > 0) {
+                if (off > 0) {
+                    std::memmove(c.rbuf, c.rbuf + off, c.rlen - off);
+                    c.rlen -= off;
+                    off = 0;
+                }
+                return upload_begin(w, c, off, req, header_end);
+            }
+#endif
+            break;
+        }
         if (pr.status == iris::http::ParseStatus::kError) return false;
 
         // Guarantee room for this response before touching the handler.
@@ -1494,9 +1736,27 @@ bool drain(Worker& w, Connection& c) {
 }
 
 bool on_readable(Worker& w, Connection& c) {
+#if defined(IRIS_HAVE_TLS)
+    if (c.state == CState::kTlsHandshake) {
+        const auto hs = iris::net::tls::handshake(conn_ssl(c));
+        if (hs == iris::net::tls::Handshake::kDone) {
+            c.state = CState::kActive;
+        } else if (hs == iris::net::tls::Handshake::kWantWrite) {
+            if (!c.want_write) {
+                w.poller.mod(c.fd, kReadable | kWritable);
+                c.want_write = true;
+            }
+            return true;
+        } else if (hs == iris::net::tls::Handshake::kWantRead) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+#endif
     for (;;) {
         if (c.rlen == c.rcap) break;  // buffer full: drain to free space
-        ssize_t n = ::recv(c.fd, c.rbuf + c.rlen, c.rcap - c.rlen, 0);
+        ssize_t n = conn_recv(c, c.rbuf + c.rlen, c.rcap - c.rlen);
         if (n > 0) {
             c.rlen += static_cast<std::size_t>(n);
             continue;
@@ -1521,12 +1781,23 @@ bool on_readable(Worker& w, Connection& c) {
         }
         return true;
     }
+#if defined(IRIS_HA)
+    if (c.state == CState::kUploadDrain) {
+        return upload_progress(w, c);
+    }
+#endif
     return drain(w, c);
 }
 
-void on_accept(Worker& w) {
+void on_accept(Worker& w, int listener_fd) {
+    const bool is_tls =
+#if defined(IRIS_HAVE_TLS)
+        (listener_fd == w.tls_listener);
+#else
+        false;
+#endif
     for (;;) {
-        int cfd = ::accept(w.listener, nullptr, nullptr);
+        int cfd = ::accept(listener_fd, nullptr, nullptr);
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EINTR) continue;
@@ -1536,6 +1807,16 @@ void on_accept(Worker& w) {
         set_nodelay(cfd);
         set_nosigpipe(cfd);
         Connection* c = w.acquire(cfd);
+#if defined(IRIS_HAVE_TLS)
+        if (is_tls) {
+            c->ssl = iris::net::tls::accept_on(cfd);
+            if (c->ssl == nullptr) {
+                w.release(c);
+                continue;
+            }
+            c->state = CState::kTlsHandshake;
+        }
+#endif
         if (!w.poller.add(cfd, kReadable)) {
             w.release(c);
         }
@@ -1553,8 +1834,12 @@ void worker_loop(Worker* wp, int cpu, bool pin) {
             int           fd = evs[i].fd;
             std::uint32_t fl = evs[i].flags;
 
-            if (fd == w.listener) {
-                on_accept(w);
+            if (fd == w.listener
+#if defined(IRIS_HAVE_TLS)
+                || fd == w.tls_listener
+#endif
+            ) {
+                on_accept(w, fd);
                 continue;
             }
 
@@ -1689,9 +1974,51 @@ bool AsyncCtx::run_db_profile(std::string_view email) noexcept {
 }
 #endif  // IRIS_WFB
 
+#if defined(IRIS_HA)
+bool AsyncCtx::run_ha_async_db(int min_price, int max_price, int limit) noexcept {
+#if defined(IRIS_HAVE_LIBPQ)
+    Worker*     w = static_cast<Worker*>(worker_);
+    Connection* c = static_cast<Connection*>(conn_);
+    if (!w || !c || !w->db_enabled) return false;
+
+    if (limit < 1) limit = 1;
+    if (limit > 50) limit = 50;
+
+    c->pend_route  = DbRoute::kHaAsyncDb;
+    c->ha_min      = min_price;
+    c->ha_max      = max_price;
+    c->pend_count  = limit;
+    c->state       = CState::kAwaitDb;
+    c->db_slot     = -1;
+
+    int slot = db_acquire(*w);
+    if (slot < 0) {
+        w->db_waiters.push_back({c, c->gen});
+        return true;
+    }
+    db_start_on_slot(*w, slot, c);
+    return true;
+#else
+    (void)min_price;
+    (void)max_price;
+    (void)limit;
+    return false;
+#endif
+}
+#endif  // IRIS_HA
+
 int run_server(const ServerConfig& cfg, Handler handler) noexcept {
     ::signal(SIGPIPE, SIG_IGN);
     iris::http::start_date_clock();
+
+#if defined(IRIS_HAVE_TLS)
+    if (cfg.tls_port > 0 && cfg.tls_cert != nullptr && cfg.tls_key != nullptr) {
+        if (!iris::net::tls::init(cfg.tls_cert, cfg.tls_key)) {
+            std::fprintf(stderr, "[iris-gw] TLS init failed\n");
+            return 1;
+        }
+    }
+#endif
 
 #if defined(IRIS_HAVE_IOURING)
     if (cfg.iou_blob != nullptr && cfg.iou_blob_len > 0) {
@@ -1735,6 +2062,20 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
         w->listener = lfd;
         w->poller.add(lfd, kReadable);
 
+#if defined(IRIS_HAVE_TLS)
+        if (cfg.tls_port > 0 && iris::net::tls::enabled()) {
+            int tfd = make_listener(cfg.tls_port, reuseport, cfg.backlog);
+            if (tfd < 0) {
+                std::fprintf(stderr, "[iris-gw] TLS listen on :%u failed: %s\n",
+                             static_cast<unsigned>(cfg.tls_port),
+                             std::strerror(errno));
+                return 1;
+            }
+            w->tls_listener = tfd;
+            w->poller.add(tfd, kReadable);
+        }
+#endif
+
 #if defined(IRIS_HAVE_IOURING)
         if (iou_active()) {
             if (!iou_worker_init(&w->iou)) {
@@ -1758,6 +2099,9 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
             for (int s = 0; s < n; ++s) {
                 db::PgConn& pc = w->db_conns[s];
                 if (!pc.connect(cfg.db.conninfo) ||
+#if defined(IRIS_HA)
+                    !pc.prepare(kStmtHaAsyncDb, kSqlHaAsyncDb, 3)
+#else
                     !pc.prepare(kStmtWorldSelect, kSqlWorldSelect, 1) ||
                     !pc.prepare(kStmtFortuneAll, kSqlFortuneAll, 0) ||
                     !pc.prepare(kStmtWorldBulk, kSqlWorldBulk, 2)
@@ -1766,6 +2110,7 @@ int run_server(const ServerConfig& cfg, Handler handler) noexcept {
                     !pc.prepare(kStmtWfbTrending, kSqlWfbTrending, 0) ||
                     !pc.prepare(kStmtWfbUpdate, kSqlWfbUpdate, 1) ||
                     !pc.prepare(kStmtWfbPosts, kSqlWfbPosts, 1)
+#endif
 #endif
                     ) {
                     std::fprintf(stderr, "[iris-gw] worker %d DB slot %d bringup "

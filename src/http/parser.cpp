@@ -88,7 +88,10 @@ inline std::size_t decode_chunked(const char* buf, std::size_t len, char* scratc
 
 }  // namespace
 
-ParseResult parse_request(const char* buf, std::size_t len, Request& out) noexcept {
+namespace {
+
+ParseResult parse_core(const char* buf, std::size_t len, Request& out,
+                       std::size_t& header_end, bool require_full_body) noexcept {
     const char*       method   = nullptr;
     std::size_t       method_len = 0;
     const char*       path     = nullptr;
@@ -148,28 +151,46 @@ ParseResult parse_request(const char* buf, std::size_t len, Request& out) noexce
     out.keep_alive     = keep_alive;
     out.content_length = content_length;
 
-    const std::size_t hdr_end = static_cast<std::size_t>(pret);
+    header_end = static_cast<std::size_t>(pret);
     if (chunked) {
-        // Decode into a per-thread scratch; the body view stays valid for the
-        // synchronous handler call (drain() consumes it before the next parse).
+        if (!require_full_body) return {ParseStatus::kError, 0};
         static thread_local char scratch[65536];
         std::size_t decoded = 0;
         const std::size_t framed =
-            decode_chunked(buf + hdr_end, len - hdr_end, scratch, sizeof(scratch),
-                           decoded);
+            decode_chunked(buf + header_end, len - header_end, scratch,
+                           sizeof(scratch), decoded);
         if (framed == 0) return {ParseStatus::kIncomplete, 0};
         if (framed == static_cast<std::size_t>(-1)) return {ParseStatus::kError, 0};
         out.body           = std::string_view(scratch, decoded);
         out.content_length = decoded;
-        return {ParseStatus::kOk, hdr_end + framed};
+        return {ParseStatus::kOk, header_end + framed};
     }
     if (has_cl) {
-        if (len < hdr_end + content_length) return {ParseStatus::kIncomplete, 0};
-        out.body = std::string_view(buf + hdr_end, content_length);
-        return {ParseStatus::kOk, hdr_end + content_length};
+        if (len < header_end + content_length) {
+            if (!require_full_body) {
+                const std::size_t have = len - header_end;
+                out.body = std::string_view(buf + header_end, have);
+                return {ParseStatus::kIncomplete, header_end};
+            }
+            return {ParseStatus::kIncomplete, 0};
+        }
+        out.body = std::string_view(buf + header_end, content_length);
+        return {ParseStatus::kOk, header_end + content_length};
     }
 
-    return {ParseStatus::kOk, hdr_end};
+    return {ParseStatus::kOk, header_end};
+}
+
+}  // namespace
+
+ParseResult parse_request(const char* buf, std::size_t len, Request& out) noexcept {
+    std::size_t header_end = 0;
+    return parse_core(buf, len, out, header_end, /*require_full_body=*/true);
+}
+
+ParseResult parse_request_headers(const char* buf, std::size_t len, Request& out,
+                                  std::size_t& header_end) noexcept {
+    return parse_core(buf, len, out, header_end, /*require_full_body=*/false);
 }
 
 }  // namespace iris::http

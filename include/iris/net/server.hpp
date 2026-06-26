@@ -38,6 +38,9 @@ enum class DbRoute : std::uint8_t {
     kWorldMany,    // /queries   : N random World rows
     kWorldUpdate,  // /updates   : N random World rows, then bulk UPDATE
     kFortunes,     // /fortunes  : all Fortune rows + one appended, sorted
+#if defined(IRIS_HA)
+    kHaAsyncDb,    // /async-db  : HttpArena items range query
+#endif
 #if defined(IRIS_WFB)
     kUserProfile,  // WFB /db/user-profile/:email
 #endif
@@ -86,6 +89,12 @@ public:
     // sendfile with no user-space copy. Mutually exclusive with set_zerocopy_body.
     void set_sendfile_response(int fd, std::size_t offset, std::size_t len) noexcept;
 
+#if defined(IRIS_HA)
+    // HttpArena /async-db?min=&max=&limit= (async Postgres, returns kSuspended).
+    [[nodiscard]] bool run_ha_async_db(int min_price, int max_price,
+                                       int limit) noexcept;
+#endif
+
     // Set by the core immediately before each handler call (opaque worker /
     // connection pointers; defined in src/net/server.cpp).
     void* worker_ = nullptr;
@@ -118,6 +127,9 @@ struct ServerConfig {
     std::size_t   read_cap     = 4096;   // per-connection read buffer
     std::size_t   write_cap    = 32768;  // per-connection write buffer (pipelining)
     DbConfig      db{};                  // optional async DB pool
+    std::uint16_t tls_port     = 0;      // 0 = TLS listener disabled
+    const char*   tls_cert     = nullptr;
+    const char*   tls_key      = nullptr;
 };
 
 // Spawn the workers and run until a fatal error. Blocks the calling thread.

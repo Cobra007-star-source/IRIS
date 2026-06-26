@@ -13,7 +13,7 @@ WORKDIR="${TMPDIR:-/tmp}/httparena-iris-pr"
 UPSTREAM="https://github.com/MDA2AV/HttpArena.git"
 FORK="${HA_FORK:-Cobra007-star-source/HttpArena}"
 BRANCH="${BRANCH:-add-iris-cpp}"
-IRIS_REF="${IRIS_REF:-v0.3.0-ha}"
+IRIS_REF="${IRIS_REF:-v0.3.1-ha}"
 GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-cobrajavinston-afk}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-cobrajavinston@gmail.com}"
 
@@ -43,10 +43,10 @@ if [[ -d "$WORKDIR/.git" ]] && git -C "$WORKDIR" rev-parse --verify "$BRANCH" >/
     GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
     GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
     git commit -m "$(cat <<EOF
-Add C++/IRIS engine (baseline, pipelined, json, static)
+Add C++/IRIS engine (baseline, pipelined, json, static, json-tls, upload, async-db)
 
 Docker image builds iris-ha-gw from ${IRIS_REF} on github.com/Cobra007-star-source/IRIS.
-AGPL-3.0. Verified on split-host EC2 (4096 conns): static ~296k req/s.
+AGPL-3.0.
 EOF
 )"
   fi
@@ -65,10 +65,10 @@ else
   GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
   GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
   git commit -m "$(cat <<EOF
-Add C++/IRIS engine (baseline, pipelined, json, static)
+Add C++/IRIS engine (baseline, pipelined, json, static, json-tls, upload, async-db)
 
 Docker image builds iris-ha-gw from ${IRIS_REF} on github.com/Cobra007-star-source/IRIS.
-AGPL-3.0. Verified on split-host EC2 (4096 conns): static ~296k req/s.
+AGPL-3.0.
 EOF
 )"
 fi
@@ -90,19 +90,22 @@ gh pr create \
 
 Adds **IRIS** ([Cobra007-star-source/IRIS](https://github.com/Cobra007-star-source/IRIS), AGPL-3.0) as a C++ \`engine\` framework:
 
-- \`frameworks/iris\` — \`baseline\`, \`pipelined\`, \`limited-conn\`, \`json\`, \`static\`
-- Docker image clones IRIS at \`${IRIS_REF}\` and builds \`iris-ha-gw\` (Release, racing profile, no DB)
+- \`frameworks/iris\` — \`baseline\`, \`pipelined\`, \`limited-conn\`, \`json\`, \`json-tls\`, \`static\`, \`upload\`, \`async-db\`
+- Docker image clones IRIS at \`${IRIS_REF}\` and builds \`iris-ha-gw\` (Release, racing profile)
 
 ## Design notes
 
 - Thread-per-core epoll/SO_REUSEPORT gateway with fixed per-connection buffers
 - \`/json/{count}?m=\` serializes from the mounted dataset per request
 - \`/static/*\` serves precompressed \`.br\`/\`.gz\` variants with Linux sendfile from sealed memfd responses
+- \`POST /upload\` streams large bodies through a 64 KiB read buffer and returns bytes actually read
+- OpenSSL TLS on :8081 for json-tls; async libpq for async-db
 
 ## Test plan
 
 - [ ] CI builds \`frameworks/iris\` Docker image
 - [ ] \`/validate -f iris\` passes on the self-hosted runner
+- [ ] \`/benchmark -f iris --save\`
 EOF
 )"
 

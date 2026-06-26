@@ -29,4 +29,11 @@ struct ParseResult {
 [[nodiscard]] ParseResult parse_request(const char* buf, std::size_t len,
                                         Request& out) noexcept;
 
+// Parse headers only. On success sets `header_end` to the byte offset past
+// the header block. When Content-Length exceeds available body bytes, returns
+// kIncomplete with `header_end` set so callers can stream-drain the body.
+[[nodiscard]] ParseResult parse_request_headers(const char* buf, std::size_t len,
+                                                Request& out,
+                                                std::size_t& header_end) noexcept;
+
 }  // namespace iris::http
