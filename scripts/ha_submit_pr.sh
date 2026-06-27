@@ -13,7 +13,7 @@ WORKDIR="${TMPDIR:-/tmp}/httparena-iris-pr"
 UPSTREAM="https://github.com/MDA2AV/HttpArena.git"
 FORK="${HA_FORK:-Cobra007-star-source/HttpArena}"
 BRANCH="${BRANCH:-add-iris-cpp}"
-IRIS_REF="${IRIS_REF:-v0.3.1-ha}"
+IRIS_REF="${IRIS_REF:-v0.3.2-ha}"
 GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-cobrajavinston-afk}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-cobrajavinston@gmail.com}"
 

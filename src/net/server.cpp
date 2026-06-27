@@ -574,14 +574,12 @@ bool db_send_ha_async_db(Worker& w, int slot, int min_p, int max_p,
                          int limit) noexcept {
     DbJob&      j  = w.db_jobs[slot];
     db::PgConn& pc = w.db_conns[slot];
-    char        pmin[4], pmax[4], plim[4];
-    be32(pmin, static_cast<std::uint32_t>(min_p));
-    be32(pmax, static_cast<std::uint32_t>(max_p));
-    be32(plim, static_cast<std::uint32_t>(limit));
+    char        pmin[16], pmax[16], plim[16];
+    std::snprintf(pmin, sizeof(pmin), "%d", min_p);
+    std::snprintf(pmax, sizeof(pmax), "%d", max_p);
+    std::snprintf(plim, sizeof(plim), "%d", limit);
     const char* values[3] = {pmin, pmax, plim};
-    constexpr int kLens[3] = {4, 4, 4};
-    constexpr int kFmts[3] = {1, 1, 1};
-    if (!pc.send_prepared(kStmtHaAsyncDb, 3, values, kLens, kFmts,
+    if (!pc.send_prepared(kStmtHaAsyncDb, 3, values, nullptr, nullptr,
                           /*result_binary=*/false)) {
         return false;
     }
@@ -1003,7 +1001,7 @@ void db_start_on_slot(Worker& w, int slot, Connection* c) {
             break;
 #if defined(IRIS_HA)
         case DbRoute::kHaAsyncDb:
-            j.total    = c->pend_count;
+            j.total    = 1;
             dispatched = db_send_ha_async_db(w, slot, c->ha_min, c->ha_max,
                                              c->pend_count);
             break;
